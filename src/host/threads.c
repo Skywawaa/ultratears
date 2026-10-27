@@ -288,6 +288,18 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    /* [Windows port] TOTK_SPIN_WAIT_US=<us>: spin before sleeping, G released. The game's job system hands work between
+       its threads thousands of times a frame and most waits end within tens of microseconds, about what waking a thread
+       from a condition variable costs on Windows: in a busy scene no thread was more than a quarter busy while frames
+       took 25-35 ms with the GPU at 5-8 ms (2026-10-27). */
+    static int spin_us = -1;
+    if (spin_us < 0) { const char *e = getenv("TOTK_SPIN_WAIT_US"); spin_us = e && *e ? atoi(e) : 0; }
+    if (spin_us > 0 && !det_wait) {
+        pthread_mutex_unlock(&G);
+        uint64_t until = now_ns() + (uint64_t)spin_us * 1000;
+        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && now_ns() < until) __builtin_ia32_pause();
+        glock();
+    }
     while (!t->woke) {
         int rc;
         if (det_wait) {
