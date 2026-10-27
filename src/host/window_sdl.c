@@ -99,6 +99,17 @@ int window_init(void) {
     return 1;
 }
 
+// The display's refresh rate (the window's display, else the primary one), which paces the game (hle_nvn.c present_cfg)
+// and the vsync events (front_win.c). TOTK_DISPLAY_HZ overrides it, e.g. for a display that reports 0.
+int mtl_display_hz(void) {
+    const char *e = getenv("TOTK_DISPLAY_HZ");
+    if (e && atoi(e) > 0) return atoi(e);
+    SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
+    if (!d) d = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+    return m && m->refresh_rate > 0 ? (int)(m->refresh_rate + 0.5f) : 60;
+}
+
 // Motion: the controller's accelerometer and gyro (SDL_EVENT_GAMEPAD_SENSOR_UPDATE) go to motion_fusion.c.
 static void pad_attached(void) {   // pad_lock held; pad may be NULL
     if (!pad) { runtime_motion_live(0); return; }

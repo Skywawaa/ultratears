@@ -17,10 +17,15 @@ void *front_metal_layer(void) { return &window_identity; }   // milestone 3.1: t
 void front_frame_presented(void) {}
 uint64_t front_game_res(int docked) { (void)docked; return (720ULL << 32) | 1280; }
 
+// [Windows port] at the display's refresh rate, or at the frame rate limit when that is higher (TOTK_FPS_LIMIT above the
+// display: the game waits for these events, so they must come at least as often as frames are wanted).
+extern int mtl_display_hz(void), totk_fps_limit(int display_hz);
 static void *vsync_thread(void *unused) {
     (void)unused;
     pthread_setname_np("totk-vsync");   // gfx_compat.h: the Darwin form
-    const uint64_t period = 16666667;   // 60 Hz until the window reports its display
+    int scr = mtl_display_hz(), hz = totk_fps_limit(scr) > scr ? totk_fps_limit(scr) : scr;
+    const uint64_t period = 1000000000ull / (uint64_t)hz;
+    fprintf(stderr, "[totk] vsync events at %d Hz (display %d Hz)\n", hz, scr);
     uint64_t next = runtime_now_ns() + period;
     for (;;) {
         plat_sleep_until_ns(next);
@@ -36,7 +41,7 @@ static void vi_initialize(void) {
     vi_ready = 1;
     pthread_t t;
     if (pthread_create(&t, NULL, vsync_thread, NULL)) runtime_fail("vsync thread");
-    fprintf(stderr, "[totk] VI display initialized (no window yet, 60 Hz vsync clock)\n");
+    fprintf(stderr, "[totk] VI display initialized\n");
 }
 static uint32_t vi_open(void **out) { if (!vi_ready || !out) return 0xf601; *out = &display_identity; return 0; }
 static uint32_t vi_layer(void **out, void *display) { if (!out || display != &display_identity) return 0xf601; *out = &layer_identity; return 0; }

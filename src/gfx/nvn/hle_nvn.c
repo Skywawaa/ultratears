@@ -2252,7 +2252,9 @@ void nvn_set_uncapped_interval(int on) {
 }
 static int uncapped_interval_on(void) {
     int v = atomic_load(&g_uncapped_interval);
-    if (v < 0) { const char *e = getenv("TOTK_UNCAPPED_INTERVAL"); v = e && atoi(e); atomic_store(&g_uncapped_interval, v); }
+    /* [Windows port] on by default: the controller's interval 2 would halve an uncapped 360 fps to 180 although the frame
+       step is measured. TOTK_UNCAPPED_INTERVAL=0 follows the game's interval again. */
+    if (v < 0) { const char *e = getenv("TOTK_UNCAPPED_INTERVAL"); v = !(e && *e && !atoi(e)); atomic_store(&g_uncapped_interval, v); }
     return v;
 }
 static double g_rt_comp_ms;   // 当前声明的实时计算量（ms；0 = 未声明） | Currently declared real-time computation amount (ms; 0 = not declared)
@@ -2544,20 +2546,16 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
 static int g_hz = -1, g_display_mode;
-/* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
-   paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
-   are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
-   clamps a frame to at least 1/120 s: above that the game would run fast. On a display of 120 Hz or more it changes nothing. */
-#define UNCAPPED_HZ 120
-/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..120 (default 120), or "display" for the display's refresh rate: the
-   iPhone app's default since 2026-10-17 (user: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are never
-   shown and only heat the phone). The game still does not wait for the display, so a scene slower than the ceiling is not
-   held to 60 / 30 steps. */
-static int uncapped_cap(int scr) {
-    const char *e = getenv("TOTK_UNCAPPED_HZ");
-    int v = !e ? UNCAPPED_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
-    return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
-}
+/* TOTK_UNCAPPED (default on with the 60 FPS patch, src/host/frame_step.c; =0 off): like vsync off in other games. The game no
+   longer waits for the display: it is paced by our own clock at the frame rate limit, and the present thread shows the
+   newest finished frame at every refresh (older ones are merged away, as when the game runs ahead). The real-time frame
+   step (tools/lifter/patches.py) has no lower bound, so any limit keeps game speed: 60, 144, 360 Hz or unlimited.
+   [Windows port] MacNativeGames capped this at 120 for its earlier 1/120 s step floor; 1.4.3's step has none. */
+extern int totk_fps60(void), totk_fps_limit(int display_hz);
+/* TOTK_FPS_LIMIT (frame_step.c): the uncapped clock's ceiling, the display's refresh rate by default. The game still does
+   not wait for the display, so a scene slower than the ceiling is not held to 60 / 30 steps. */
+static int uncapped_cap(int scr) { return totk_fps_limit(scr); }
+#define UNCAPPED_HZ 120   // the uncapped rate dm_nvn_probe_present_interval checks against
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
@@ -2568,11 +2566,10 @@ static void present_cfg(const win_t *o) {
     int realtime = !(rt && !strcmp(rt, "0"));
     g_hz = g_paced_hz = e ? atoi(e) : (realtime && scr > 0 ? scr : 60);
     { const char *u = getenv("TOTK_UNCAPPED"), *f60 = getenv("TOTK_FPS60");   // the original 30-frame mode needs fixed pacing; MetalFX interpolation suspends it while on (uncapped_now)
-      // [port] Uncapped needs MacNativeGames' 60 FPS game patches and real-time frame step (game_patches_v143.c), not
-      // ported yet: without them the engine steps game time per frame as if at its chosen
-      // interval, and ~60 presents a second ran the game fast. Off unless TOTK_UNCAPPED=1.
-      g_uncapped = !e && realtime && u && !strcmp(u, "1") && !(f60 && !strcmp(f60, "0")) && g_hz < UNCAPPED_HZ; }
-    if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] uncapped (TOTK_UNCAPPED, on by default; =0 disables): independent clock capped at %d fps (TOTK_UNCAPPED_HZ); %d Hz display shows the latest frame each refresh%s", g_hz, scr,
+      // [Windows port] the 60 FPS patch and the real-time frame step are tools/lifter/patches.py + src/host/frame_step.c
+      (void)f60;
+      g_uncapped = !e && realtime && !(u && !strcmp(u, "0")) && totk_fps60(); }
+    if (g_uncapped) { g_hz = uncapped_cap(scr); LOG("[nvn] uncapped (TOTK_UNCAPPED, on by default; =0 disables): independent clock capped at %d fps (TOTK_FPS_LIMIT); %d Hz display shows the latest frame each refresh%s", g_hz, scr,
                                        mfx_enabled() ? " (paused while interpolation is on: one game frame per two refreshes)" : " (paused when interpolation is enabled with key 2)"); }
     if (!g_hz) LOG("[nvn] [warning] DM_PRESENT_HZ=0: uncapped timing differs from real hardware and may affect UI logic (profiling only)");
     // 剪口（有意偏离原版行为）：DM_PRESENT_INTERVAL=display 时不按游戏设的出图间隔，每个节拍出一帧，
