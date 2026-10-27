@@ -136,6 +136,85 @@ static const char *cache_dir(void) {
     return d;
 }
 
+// ---------------- the shader pack (<cache>/shaders.pack, tools/pack_shaders.py) ----------------
+// One file instead of a .spv and a .res.json per shader (~57,000 files: slow to copy, back up and sync). Layout,
+// little-endian: "UTSHPK01", u32 count, u32 0, then count entries sorted by key {u8 key[32] (the SHA-256); u64 offset;
+// u32 SPIR-V bytes; u32 reflection bytes} (the SPIR-V at offset, its reflection right after it), then the data.
+// Without a pack, or for a key not in it, the loose files are read as before.
+typedef struct { uint8_t key[32]; uint64_t off; uint32_t nspv, njson; } pack_entry;
+_Static_assert(sizeof(pack_entry) == 48, "shader pack entry layout");
+static HANDLE g_pack = INVALID_HANDLE_VALUE;
+static pack_entry *g_pack_ix;
+static uint32_t g_pack_n;
+static int read_at(HANDLE h, uint64_t off, void *buf, uint32_t n) {   // positioned read: safe from several threads
+    OVERLAPPED o = {0};
+    o.Offset = (DWORD)off;
+    o.OffsetHigh = (DWORD)(off >> 32);
+    DWORD got = 0;
+    return ReadFile(h, buf, n, &got, &o) && got == n;
+}
+static void pack_open(void) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/shaders.pack", cache_dir());
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    uint8_t hd[16];
+    uint32_t n = 0;
+    if (read_at(h, 0, hd, sizeof hd) && !memcmp(hd, "UTSHPK01", 8)) memcpy(&n, hd + 8, 4);
+    pack_entry *ix = n && n < (1u << 24) ? malloc((size_t)n * sizeof *ix) : NULL;
+    if (!ix || !read_at(h, sizeof hd, ix, n * (uint32_t)sizeof *ix)) {
+        VLOG("%s: not a shader pack, the loose files are used", path);
+        free(ix);
+        CloseHandle(h);
+        return;
+    }
+    g_pack = h;
+    g_pack_ix = ix;
+    g_pack_n = n;
+    VLOG("shader pack: %u shaders in %s", n, path);
+}
+static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+static int pack_read(const char *key, char **json, uint32_t **spv, size_t *nspv) {
+    uint8_t k[32];
+    for (int i = 0; i < 32; i++) {
+        int hi = hexval(key[2 * i]), lo = hi < 0 ? -1 : hexval(key[2 * i + 1]);
+        if (lo < 0) return 0;
+        k[i] = (uint8_t)(hi << 4 | lo);
+    }
+    size_t lo = 0, hi = g_pack_n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = memcmp(g_pack_ix[mid].key, k, 32);
+        if (c < 0) { lo = mid + 1; continue; }
+        if (c > 0) { hi = mid; continue; }
+        const pack_entry *e = &g_pack_ix[mid];
+        char *s = malloc((size_t)e->nspv + 1), *j = malloc((size_t)e->njson + 1);
+        if (!s || !j || !read_at(g_pack, e->off, s, e->nspv) || !read_at(g_pack, e->off + e->nspv, j, e->njson)) {
+            free(s);
+            free(j);
+            return 0;
+        }
+        s[e->nspv] = 0;
+        j[e->njson] = 0;
+        *spv = (uint32_t *)s;
+        *json = j;
+        *nspv = e->nspv;
+        return 1;
+    }
+    return 0;
+}
+// A shader's translation (SPIR-V) and reflection (JSON), malloc'd and NUL-terminated: from the pack, else the loose files.
+static void read_translation(const char *key, char **json, uint32_t **spv, size_t *nspv) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, pack_open);
+    if (g_pack_n && strlen(key) >= 64 && pack_read(key, json, spv, nspv)) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.res.json", cache_dir(), key);
+    *json = read_file(path, NULL);
+    snprintf(path, sizeof path, "%s/%s.spv", cache_dir(), key);
+    *spv = (uint32_t *)read_file(path, nspv);
+}
+
 // The translator declares gl_PerVertex with ClipDistance[8] and CullDistance[1]: 9 > maxCombinedClipAndCullDistances (8)
 // on NVIDIA, though no shader writes the cull distance. The CullDistance member (the block's last) is dropped: its
 // OpTypeStruct operand, OpMemberName and OpMemberDecorate. Returns the new word count.
@@ -215,12 +294,10 @@ VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t 
 
 // Reads the reflection, rewrites the SPIR-V bindings into the universal layout, creates the shader object.
 static int load(vkb_shader *s, const char *key, int nvn_stage) {
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s.res.json", cache_dir(), key);
-    char *j = read_file(path, NULL);
-    snprintf(path, sizeof path, "%s/%s.spv", cache_dir(), key);
+    char *j = NULL;
+    uint32_t *spv = NULL;
     size_t nspv = 0;
-    uint32_t *spv = (uint32_t *)read_file(path, &nspv);
+    read_translation(key, &j, &spv, &nspv);
     if (!j || !spv || nspv < 20 || (nspv & 3) || spv[0] != 0x07230203) { free(j); free(spv); return 0; }
     s->stage = nvn_stage;
     uint32_t base = nvn_stage == 1 ? VKB_STAGE_BINDINGS : 0;

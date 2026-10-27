@@ -360,6 +360,10 @@ def step_shaders(dump, state, cpus):
     run([sys.executable, 'tools/run_ryujinx_xlate.py', out, '--workers', min(cpus, 32), '--quiet'] + new_only,
         'translating the shaders')
     state['shaders-xlate'] = xlate
+    from pack_shaders import pack, stale   # one file instead of two per shader (src/gfx/vkb_shader.c reads it first)
+    if stale(out / 'ryujinx'):
+        n, size = pack(out / 'ryujinx')
+        say(f'  {n} shaders packed into data\\shaders\\ryujinx\\shaders.pack ({size / 2**20:.0f} MiB)')
     return 'done'
 
 
