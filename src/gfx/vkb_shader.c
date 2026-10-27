@@ -509,7 +509,11 @@ VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t 
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(out, 4, nw, f); fclose(f); }
         }
-        if (create_object(NULL, VK_SHADER_STAGE_VERTEX_BIT, out, nw * 4, &obj) != VK_SUCCESS) obj = VK_NULL_HANDLE;
+        // [Windows port] kept between runs too, under the shader's key with the masks in its last 16 digits (variants
+        // were compiled at their first draw every run: freezes of ~200 ms in play, 2026-10-27)
+        char vkey[65];
+        snprintf(vkey, sizeof vkey, "%.48s%08x%08x", s->key ? s->key : "", intmask, sintmask);
+        if (create_object(s->key && strlen(s->key) >= 48 ? vkey : NULL, VK_SHADER_STAGE_VERTEX_BIT, out, nw * 4, &obj) != VK_SUCCESS) obj = VK_NULL_HANDLE;
         free(out);
     }
     if (!obj) {

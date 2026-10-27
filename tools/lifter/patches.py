@@ -144,7 +144,17 @@ RESOLUTION = {
                                          'ST64(c->x[19] + 0x10, c->x[3]); c->x[4] = c->x[3] >> 32; }'),
 }
 
+def bench_cam(gen, addr):
+    """The benchmark's camera (src/host/bench.c, TOTK_BENCH): main+0x628828 (adrp x9, the instruction after the look-at
+    camera update stored this frame's eye and target into the camera in x20 and before it builds the view matrix from
+    d1, d2, d0 / d3, d4, d5; the point MacNativeGames' benchmark camera and UltraCam's camera controller hook use).
+    totk_bench_cam turns the eye about the target while the benchmark measures, then the original instruction runs."""
+    expect(gen, addr, 0xf0019a29, 'bench_cam')
+    return '{ extern void totk_bench_cam(Cpu *c); totk_bench_cam(c); } ' + lifted(gen, addr, 0xf0019a29)
+
+
 PATCHES = {
+    0x800628828: bench_cam,
     0x8005843e0: drs_off,
     **FPS60, **REALTIME, **CLOTH, **BOUNCE, **RESOLUTION,
 }

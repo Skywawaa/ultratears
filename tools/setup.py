@@ -397,6 +397,18 @@ def step_finish(dump, state, cpus):
               '#TOTK_RENDER_RES=display',
               '#TOTK_OUTPUT_RES=display']
     (ROOT / 'ultratears.cfg').write_text('\n'.join(lines) + '\n')
+    # The benchmark (src/host/bench.c): the newest save of bench\userdata, a copy of the saves made at its first run (to
+    # benchmark another place, save there in the game and delete bench\userdata). Result in bench\.
+    (ROOT / 'bench.bat').write_text(
+        '@echo off\n'
+        'rem The benchmark: loads the newest save of bench\\userdata, turns the camera once around Link for 60 s,\n'
+        'rem writes bench\\bench-<date>.txt and bench\\results.csv, then quits. Delete bench\\userdata to take your current saves again.\n'
+        'cd /d "%~dp0"\n'
+        'if not exist bench\\userdata xcopy /e /i /q userdata bench\\userdata >nul\n'
+        'set TOTK_PROFILE_DIR=bench\\userdata\n'
+        'if "%TOTK_BENCH%"=="" set TOTK_BENCH=60\n'
+        '"%~dp0UltraTears.exe" 2> bench\\last-run.log\n'   # by path: cmd may not run programs from the current folder
+        'type bench\\results.csv\n')
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():
         say(f'  The game reads data\\romfs and data\\exefs now: {dump} (16 GB) is no longer needed.')

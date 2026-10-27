@@ -1236,10 +1236,22 @@ void mtl_tex_release(tex_t *t) { vkb_tex_release(t); }
 // TOTK_SHOT=<present number>:<file.bmp>: saves that presented frame (development check of the picture).
 static VkBuffer g_shot_buf;
 static VkDeviceMemory g_shot_mem;
+static char g_shot_path[512];
+static char g_shot_req[512];   // vkb_request_shot: the next presented frame (the benchmark's TOTK_BENCH_SHOTS)
+static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER;
+void vkb_request_shot(const char *path) { pthread_mutex_lock(&g_shot_mu); snprintf(g_shot_req, sizeof g_shot_req, "%s", path); pthread_mutex_unlock(&g_shot_mu); }
 static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_t w, uint32_t h) {
     static long long at = -1;
     if (at == -1) { const char *e = getenv("TOTK_SHOT"); at = e ? atoll(e) : 0; }
-    if (at <= 0 || (uint64_t)at != n) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_shot_mu);
+    int asked = g_shot_req[0] != 0;
+    if (asked) { memcpy(g_shot_path, g_shot_req, sizeof g_shot_path); g_shot_req[0] = 0; }
+    pthread_mutex_unlock(&g_shot_mu);
+    if (!asked) {
+        if (at <= 0 || (uint64_t)at != n) return VK_NULL_HANDLE;
+        const char *e = getenv("TOTK_SHOT"), *p = e ? strchr(e, ':') : NULL;
+        snprintf(g_shot_path, sizeof g_shot_path, "%s", p ? p + 1 : "");
+    }
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * 4,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf), "shot buffer")) return VK_NULL_HANDLE;
@@ -1258,11 +1270,11 @@ static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_
     return g_shot_buf;
 }
 static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
-    const char *e = getenv("TOTK_SHOT"), *path = e ? strchr(e, ':') : NULL;
+    const char *path = g_shot_path;
     mtl_wait(fence, UINT64_MAX);
     void *px = NULL;
-    if (path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &px) == VK_SUCCESS) {
-        FILE *f = fopen(path + 1, "wb");
+    if (*path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &px) == VK_SUCCESS) {
+        FILE *f = fopen(path, "wb");
         if (f) {   // 32-bit BGRA, top-down
             uint32_t size = w * h * 4;
             uint8_t hdr[54] = {'B', 'M'};
@@ -1277,7 +1289,7 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
             fwrite(hdr, 1, sizeof hdr, f);
             fwrite(px, 1, size, f);
             fclose(f);
-            VLOG("frame saved to %s (%ux%u)", path + 1, w, h);
+            VLOG("frame saved to %s (%ux%u)", path, w, h);
         }
         vk.vkUnmapMemory(vkc.device, g_shot_mem);
     }
@@ -1397,7 +1409,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     vkb_gprof_report();
     pp_report();
     static int shot_wanted = -1;
-    if (shot_wanted < 0) shot_wanted = getenv("TOTK_SHOT") || getenv("TOTK_DUMP");
+    if (shot_wanted < 0) shot_wanted = getenv("TOTK_SHOT") || getenv("TOTK_DUMP") || getenv("TOTK_BENCH_SHOTS");
     vkb_image *im = g_ok == 1 && (vkp_active() || shot_wanted) ? vkb_image_of(t) : NULL;   // headless: only for TOTK_SHOT
     if (!im) { vkp_frame(); return n; }
     VkImage out;

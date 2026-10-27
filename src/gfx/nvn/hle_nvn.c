@@ -2680,6 +2680,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     { extern void vkr_sim_end(uint64_t frame); vkr_sim_end(g_frame + 1); }   // Reflex: this frame's id, as the present job's
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
+    { extern void runtime_bench_frame(uint64_t now); runtime_bench_frame(now_ns()); }   // [Windows port] TOTK_BENCH (src/host/bench.c)
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;

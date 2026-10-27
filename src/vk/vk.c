@@ -242,6 +242,8 @@ static int create_device(void) {
     return 1;
 }
 
+const char *vkb_gpu_name(void) { return vkc.props.deviceName; }   // the benchmark report (bench.c)
+
 int vk_init(SDL_Window *window) {
     static int state;   // 0 not tried, 1 ready, -1 failed
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;

@@ -847,6 +847,11 @@ static void astc_find(void *ctx, int i) {   // deswizzle, hash and look up one s
     s->have = vkb_bc7_lookup(s->k, &s->fmt, &len) &&
               len == (s->fmt == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld));
 }
+static void plain_deswizzle(void *ctx, int i) {   // one surface of a texture that is not ASTC
+    astc_job *j = ctx;
+    surf_t *s = &j->sf[i];
+    if (nvn_deswizzle(j->d, s->level, s->layer, j->src, (uint8_t *)s->rows, j->pitch[i])) s->rows = NULL;
+}
 typedef struct { surf_t *sf; uint8_t **blocks; size_t *n; int *ok; } read_job;
 static void bc_read_one(void *ctx, int i) {
     read_job *j = ctx;
@@ -1018,6 +1023,40 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
         return 1;
     }
     vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (!im->astc && !depth_up && im->levels * im->layers > 1) {   // [Windows port] the surfaces deswizzled in parallel (par_for)
+        int ns = (int)(im->levels * im->layers), k = 0;
+        surf_t *sf = calloc((size_t)ns, sizeof *sf);
+        uint32_t *pitches = calloc((size_t)ns, sizeof *pitches);
+        VkDeviceSize *sizes = calloc((size_t)ns, sizeof *sizes), *offs = calloc((size_t)ns, sizeof *offs);
+        VkBuffer *bufs = calloc((size_t)ns, sizeof *bufs);
+        if (!sf || !pitches || !sizes || !offs || !bufs) die("texture surfaces");
+        for (uint32_t level = 0; level < im->levels; level++) {
+            uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
+            uint32_t ld = im->depth >> level ? im->depth >> level : 1;
+            uint32_t bx = (lw + bw - 1) / bw, by = (lh + bh - 1) / bh, pitch = bx * (uint32_t)bpb;
+            VkDeviceSize slice = (VkDeviceSize)pitch * by;
+            for (uint32_t layer = 0; layer < im->layers; layer++, k++) {
+                sf[k] = (surf_t){vkb_ring_alloc(slice * ld, 16, &bufs[k], &offs[k]), NULL, {0, 0}, level, layer, lw, lh, ld, 0, 0, slice};
+                pitches[k] = pitch;
+                sizes[k] = slice * ld;
+            }
+        }
+        astc_job dj = {sf, d, src, bw, bh, srgb, pitches, sizes};
+        par_for(ns, plain_deswizzle, &dj);
+        for (int i = 0; i < ns; i++) {
+            const surf_t *s = &sf[i];
+            if (!s->rows) continue;
+            uint32_t bx = (s->lw + bw - 1) / bw, by = (s->lh + bh - 1) / bh;
+            VkBufferImageCopy r = {.bufferOffset = offs[i], .bufferRowLength = bx * (uint32_t)bw, .bufferImageHeight = by * (uint32_t)bh,
+                                   .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s->level, s->layer, 1}, .imageExtent = {s->lw, s->lh, s->ld}};
+            vkb_checkpoint("upload texture", NULL, NULL);
+            vk.vkCmdCopyBufferToImage(cb, bufs[i], im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        }
+        free(sf); free(pitches); free(sizes); free(offs); free(bufs);
+        free(gathered);
+        __atomic_store_n(&im->uploading, 0, __ATOMIC_RELEASE);
+        return 1;
+    }
     for (uint32_t level = 0; level < im->levels; level++) {
         uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
         uint32_t ld = im->depth >> level ? im->depth >> level : 1;

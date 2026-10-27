@@ -517,6 +517,7 @@ static File *file_of(uint64_t h, int *fd, int *mode) {
 static unsigned open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) return romfs_open(out, path, mode);
     if (path) runtime_fs_log(mode & 2 ? "write" : "read", path);
+    { void runtime_bench_file(const char *path); runtime_bench_file(path); }   // the benchmark (bench.c): save found, save loading
     if (!out || !(mode & (OPEN_READ | OPEN_WRITE)) || (mode & ~7)) return R_INVALID_ARGUMENT;
     char p[1100];
     int kind = M_FREE;
