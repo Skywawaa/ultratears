@@ -107,9 +107,10 @@ static char *read_file(const char *path, size_t *n) {
 }
 
 // ---------------- shaders by key ----------------
-typedef struct shentry { char key[65]; int c1_set, prewarmed; vkb_shader sh; struct shentry *next; } shentry;   // prewarmed: made ahead (prewarm_thread)
+typedef struct shentry { char key[65]; int c1_set, prewarmed, loading; vkb_shader sh; struct shentry *next; } shentry;   // prewarmed: made ahead (prewarm_thread); loading: being made (vkb_shader_get)
 static shentry *g_tab[4096];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_loaded_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_loaded, g_missing;
 
 static BCRYPT_ALG_HANDLE g_sha;   // opened once (opening it per hash cost more than the hash)
@@ -174,13 +175,17 @@ static void pack_open(void) {
     VLOG("shader pack: %u shaders in %s", n, path);
 }
 static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
-static int pack_read(const char *key, char **json, uint32_t **spv, size_t *nspv) {
-    uint8_t k[32];
+static int key_bytes(const char *key, uint8_t k[32]) {   // the 64 hex digits of a key as its 32 bytes
     for (int i = 0; i < 32; i++) {
         int hi = hexval(key[2 * i]), lo = hi < 0 ? -1 : hexval(key[2 * i + 1]);
         if (lo < 0) return 0;
         k[i] = (uint8_t)(hi << 4 | lo);
     }
+    return 1;
+}
+static int pack_read(const char *key, char **json, uint32_t **spv, size_t *nspv) {
+    uint8_t k[32];
+    if (!key_bytes(key, k)) return 0;
     size_t lo = 0, hi = g_pack_n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
@@ -204,9 +209,9 @@ static int pack_read(const char *key, char **json, uint32_t **spv, size_t *nspv)
     return 0;
 }
 // A shader's translation (SPIR-V) and reflection (JSON), malloc'd and NUL-terminated: from the pack, else the loose files.
+static pthread_once_t g_pack_once = PTHREAD_ONCE_INIT;
 static void read_translation(const char *key, char **json, uint32_t **spv, size_t *nspv) {
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, pack_open);
+    pthread_once(&g_pack_once, pack_open);
     if (g_pack_n && strlen(key) >= 64 && pack_read(key, json, spv, nspv)) return;
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.res.json", cache_dir(), key);
@@ -244,13 +249,153 @@ static size_t drop_cull_distance(uint32_t *w, size_t n) {
     return o;
 }
 
-static VkResult create_object(VkShaderStageFlagBits stage, const uint32_t *spv, size_t bytes, VkShaderEXT *obj) {
+// ---------------- compiled shaders kept between runs ----------------
+// [Windows port] Creating a shader object from SPIR-V compiles it in the driver, a few ms each and hundreds at once where
+// a place is first seen: freezes of 0.2 to 2 s in play (2026-10-27). Every shader made from SPIR-V gives its compiled
+// binary (vkGetShaderBinaryDataEXT), appended to <cache>/binaries-<the driver's shaderBinaryUUID>.bin; a later run
+// creates it from that binary, which is not compiled again. A new driver (another UUID or binary version) starts a new
+// file. Layout: "UTSHBN01", u32 shaderBinaryVersion, u32 0, then records {u8 key[32]; u32 size; u32 0; data[size]}.
+// A record cut short (the game closed while writing) ends the file there. TOTK_SHADER_BINARIES=0: off.
+typedef struct { uint8_t key[32]; uint64_t off; uint32_t size; } bin_entry;
+static HANDLE g_bin = INVALID_HANDLE_VALUE;
+static bin_entry *g_bin_e;
+static uint32_t g_bin_n, g_bin_cap, *g_bin_slot, g_bin_slots;   // open-addressing index into g_bin_e (+1; 0 = empty)
+static uint64_t g_bin_hits;
+static pthread_mutex_t g_bin_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t bin_hash(const uint8_t k[32]) { uint32_t h; memcpy(&h, k, 4); return h; }   // the key is a SHA-256
+static void bin_index(uint32_t i) {   // g_bin_mu held (or before any thread)
+    if (2 * (g_bin_n + 1) > g_bin_slots) {
+        uint32_t n = g_bin_slots ? g_bin_slots * 2 : 1u << 16, *s = calloc(n, sizeof *s);
+        if (!s) die("shader binary index");
+        for (uint32_t j = 0; j < g_bin_slots; j++)
+            if (g_bin_slot[j]) { uint32_t h = bin_hash(g_bin_e[g_bin_slot[j] - 1].key) & (n - 1); while (s[h]) h = (h + 1) & (n - 1); s[h] = g_bin_slot[j]; }
+        free(g_bin_slot);
+        g_bin_slot = s;
+        g_bin_slots = n;
+    }
+    uint32_t h = bin_hash(g_bin_e[i].key) & (g_bin_slots - 1);
+    while (g_bin_slot[h]) h = (h + 1) & (g_bin_slots - 1);
+    g_bin_slot[h] = i + 1;
+    g_bin_n++;
+}
+static int bin_add_entry(const uint8_t k[32], uint64_t off, uint32_t size) {   // g_bin_mu held
+    if (g_bin_n == g_bin_cap) {
+        g_bin_cap = g_bin_cap ? g_bin_cap * 2 : 1u << 14;
+        g_bin_e = realloc(g_bin_e, g_bin_cap * sizeof *g_bin_e);
+        if (!g_bin_e) die("shader binary index");
+    }
+    memcpy(g_bin_e[g_bin_n].key, k, 32);
+    g_bin_e[g_bin_n].off = off;
+    g_bin_e[g_bin_n].size = size;
+    bin_index(g_bin_n);
+    return 1;
+}
+static const bin_entry *bin_find_k(const uint8_t k[32]) {   // g_bin_mu held
+    if (!g_bin_slots) return NULL;
+    for (uint32_t h = bin_hash(k) & (g_bin_slots - 1); g_bin_slot[h]; h = (h + 1) & (g_bin_slots - 1))
+        if (!memcmp(g_bin_e[g_bin_slot[h] - 1].key, k, 32)) return &g_bin_e[g_bin_slot[h] - 1];
+    return NULL;
+}
+static void bin_open(void) {
+    const char *e = getenv("TOTK_SHADER_BINARIES");
+    if (e && *e == '0') return;
+    char path[1024], uuid[33];
+    for (int i = 0; i < 16; i++) snprintf(uuid + 2 * i, 3, "%02x", vkc.so.shaderBinaryUUID[i]);
+    snprintf(path, sizeof path, "%s/binaries-%s.bin", cache_dir(), uuid);
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { VLOG("shader binaries: cannot open %s, shaders are compiled every run", path); return; }
+    LARGE_INTEGER size;
+    GetFileSizeEx(h, &size);
+    uint8_t hd[16], want[16] = "UTSHBN01";
+    memcpy(want + 8, &vkc.so.shaderBinaryVersion, 4);
+    uint64_t end = 16;
+    if (size.QuadPart < 16 || !read_at(h, 0, hd, 16) || memcmp(hd, want, 16)) {   // new, or another binary version: start over
+        SetFilePointer(h, 0, NULL, FILE_BEGIN);
+        SetEndOfFile(h);
+        DWORD w;
+        WriteFile(h, want, 16, &w, NULL);
+    } else {
+        uint8_t rh[40];
+        while (end + 40 <= (uint64_t)size.QuadPart && read_at(h, end, rh, 40)) {
+            uint32_t n;
+            memcpy(&n, rh + 32, 4);
+            if (end + 40 + n > (uint64_t)size.QuadPart) break;
+            bin_add_entry(rh, end + 40, n);
+            end += 40 + n;
+        }
+    }
+    g_bin = h;
+    VLOG("shader binaries: %u kept from earlier runs (%.0f MiB, %s)", g_bin_n, end / 1048576.0, path);
+}
+static pthread_once_t g_bin_once = PTHREAD_ONCE_INIT;
+static void bin_store(const char *key, VkShaderEXT obj) {
+    uint8_t k[32];
+    if (g_bin == INVALID_HANDLE_VALUE || !key_bytes(key, k)) return;
+    size_t n = 0;
+    if (vk.vkGetShaderBinaryDataEXT(vkc.device, obj, &n, NULL) != VK_SUCCESS || !n || n > (64u << 20)) return;
+    uint8_t *rec = malloc(40 + n);
+    if (!rec) return;
+    if (vk.vkGetShaderBinaryDataEXT(vkc.device, obj, &n, rec + 40) != VK_SUCCESS) { free(rec); return; }
+    uint32_t size = (uint32_t)n, zero = 0;
+    memcpy(rec, k, 32);
+    memcpy(rec + 32, &size, 4);
+    memcpy(rec + 36, &zero, 4);
+    pthread_mutex_lock(&g_bin_mu);
+    if (!bin_find_k(k)) {   // the game and the compiler process append to one file: at its end, under a file lock
+        OVERLAPPED lk = {0}, o = {0};
+        LARGE_INTEGER end;
+        if (LockFileEx(g_bin, LOCKFILE_EXCLUSIVE_LOCK, 0, 16, 0, &lk)) {
+            DWORD w = 0;
+            if (GetFileSizeEx(g_bin, &end)) {
+                o.Offset = (DWORD)end.QuadPart;
+                o.OffsetHigh = (DWORD)(end.QuadPart >> 32);
+                if (WriteFile(g_bin, rec, (DWORD)(40 + n), &w, &o) && w == 40 + n) {
+                    bin_add_entry(k, (uint64_t)end.QuadPart + 40, size);
+                }
+            }
+            UnlockFileEx(g_bin, 0, 16, 0, &lk);
+        }
+    }
+    pthread_mutex_unlock(&g_bin_mu);
+    free(rec);
+}
+static int bin_have(const char *key) {
+    uint8_t k[32];
+    if (g_bin == INVALID_HANDLE_VALUE || !key_bytes(key, k)) return 0;
+    pthread_mutex_lock(&g_bin_mu);
+    int have = bin_find_k(k) != NULL;
+    pthread_mutex_unlock(&g_bin_mu);
+    return have;
+}
+
+// key: the shader's key, for the binaries kept between runs (NULL: a variant, always compiled)
+static VkResult create_object(const char *key, VkShaderStageFlagBits stage, const uint32_t *spv, size_t bytes, VkShaderEXT *obj) {
+    pthread_once(&g_bin_once, bin_open);
     VkDescriptorSetLayout layout = vkb_set_layout(stage == VK_SHADER_STAGE_COMPUTE_BIT);
     VkShaderCreateInfoEXT ci = {VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = stage,
         .nextStage = stage == VK_SHADER_STAGE_VERTEX_BIT ? VK_SHADER_STAGE_FRAGMENT_BIT : 0,
         .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = bytes, .pCode = spv, .pName = "main",
         .setLayoutCount = 1, .pSetLayouts = &layout};
-    return vk.vkCreateShadersEXT(vkc.device, 1, &ci, NULL, obj);
+    uint8_t k[32];
+    if (key && g_bin != INVALID_HANDLE_VALUE && key_bytes(key, k)) {
+        pthread_mutex_lock(&g_bin_mu);
+        const bin_entry *b = bin_find_k(k);
+        bin_entry be = b ? *b : (bin_entry){{0}, 0, 0};
+        pthread_mutex_unlock(&g_bin_mu);
+        void *data = b ? malloc(be.size) : NULL;
+        if (data && read_at(g_bin, be.off, data, be.size)) {
+            VkShaderCreateInfoEXT bi = ci;
+            bi.codeType = VK_SHADER_CODE_TYPE_BINARY_EXT;
+            bi.codeSize = be.size;
+            bi.pCode = data;
+            VkResult r = vk.vkCreateShadersEXT(vkc.device, 1, &bi, NULL, obj);
+            free(data);
+            if (r == VK_SUCCESS) { __atomic_fetch_add(&g_bin_hits, 1, __ATOMIC_RELAXED); return r; }
+        } else free(data);
+    }
+    VkResult r = vk.vkCreateShadersEXT(vkc.device, 1, &ci, NULL, obj);
+    if (r == VK_SUCCESS && key) bin_store(key, *obj);
+    return r;
 }
 
 // A vertex shader for integer attributes at the locations in intmask (signed where sintmask has the bit): those
@@ -275,7 +420,7 @@ VkShaderEXT vkb_shader_variant(const vkb_shader *cs, uint32_t intmask, uint32_t 
             FILE *f = fopen(path, "wb");
             if (f) { fwrite(out, 4, nw, f); fclose(f); }
         }
-        if (create_object(VK_SHADER_STAGE_VERTEX_BIT, out, nw * 4, &obj) != VK_SUCCESS) obj = VK_NULL_HANDLE;
+        if (create_object(NULL, VK_SHADER_STAGE_VERTEX_BIT, out, nw * 4, &obj) != VK_SUCCESS) obj = VK_NULL_HANDLE;
         free(out);
     }
     if (!obj) {
@@ -376,7 +521,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage) {
         i += wc;
     }
     VkShaderStageFlagBits stage = nvn_stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : nvn_stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
-    VkResult r = create_object(stage, spv, nspv, &s->obj);
+    VkResult r = create_object(key, stage, spv, nspv, &s->obj);
     if (r == VK_SUCCESS) {   // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
         s->in_mask = vkb_spv_input_mask(spv, nspv / 4);
         s->out_mask = vkb_spv_output_mask(spv, nspv / 4);
@@ -412,6 +557,157 @@ static void list_add(const char *key, int stage) {   // g_mu held
     if (!f) return;
     fprintf(f, "%s %d\n", key, stage);
     fclose(f);
+}
+/* [Windows port] Every shader of the pack compiled once, ahead, in another process: `UltraTears --compile-shaders <game
+   pid>` (started by the game while <cache>/binaries-<uuid>.done is missing) runs `--compile-shaders-child`, which compiles
+   each shader that has no kept binary yet at below-normal priority and keeps its binary (the object is destroyed: only
+   the binary is wanted). A driver that crashes compiling a shader takes only that process down (seen once with NVIDIA,
+   2026-10-27, on one of the ~28,700 shaders): the supervisor puts the shader each thread was compiling
+   (<cache>/compiling-<n>.txt) on <cache>/bad-shaders.txt and starts it again. It stops with the game (the next run goes
+   on where it stopped) and writes the .done file when the pack is through. Log: <cache>/shader-compile.log.
+   TOTK_SHADER_PREWARM=list: only the list above, nothing compiled ahead. */
+static _Atomic uint32_t g_pack_at;
+static _Atomic uint64_t g_pack_made;
+static char *g_bad;   // bad-shaders.txt: keys never compiled ahead (65 bytes a line)
+static size_t g_bad_n;
+static int spv_nvn_stage(const uint32_t *w, size_t n) {
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc) break;
+        if (op == 15 && wc >= 3) return w[i + 1] == 0 ? 0 : w[i + 1] == 4 ? 1 : w[i + 1] == 5 ? 5 : -1;   // OpEntryPoint
+        i += wc;
+    }
+    return -1;
+}
+static int is_bad(const char *key) {
+    for (size_t at = 0; at + 64 <= g_bad_n; at += 65) if (!memcmp(g_bad + at, key, 64)) return 1;
+    return 0;
+}
+static void done_path(char *path, size_t n) {
+    char uuid[33];
+    for (int i = 0; i < 16; i++) snprintf(uuid + 2 * i, 3, "%02x", vkc.so.shaderBinaryUUID[i]);
+    snprintf(path, n, "%s/binaries-%s.done", cache_dir(), uuid);
+}
+static void *compile_thread(void *arg) {
+    int me = (int)(intptr_t)arg;
+    char mine[1024];
+    snprintf(mine, sizeof mine, "%s/compiling-%d.txt", cache_dir(), me);
+    uint64_t t0 = runtime_now_ns();
+    for (uint32_t i; (i = atomic_fetch_add(&g_pack_at, 1)) < g_pack_n;) {
+        static const char hex[] = "0123456789abcdef";
+        char key[65];
+        for (int b = 0; b < 32; b++) { key[2 * b] = hex[g_pack_ix[i].key[b] >> 4]; key[2 * b + 1] = hex[g_pack_ix[i].key[b] & 15]; }
+        key[64] = 0;
+        if (bin_have(key) || is_bad(key)) continue;
+        char *j = NULL;
+        uint32_t *spv = NULL;
+        size_t nspv = 0;
+        read_translation(key, &j, &spv, &nspv);
+        int stage = spv && nspv >= 20 ? spv_nvn_stage(spv, nspv / 4) : -1;
+        free(j);
+        free(spv);
+        FILE *f = fopen(mine, "wb");   // what this thread compiles: on a crash, the supervisor skips it next time
+        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        vkb_shader tmp = {0};
+        tmp.key = key;
+        if (stage < 0 || !load(&tmp, key, stage)) continue;
+        vk.vkDestroyShaderEXT(vkc.device, tmp.obj, NULL);
+        free(tmp.spv);
+        uint64_t n = atomic_fetch_add(&g_pack_made, 1) + 1;
+        if (n % 1000 == 0) VLOG("shaders compiled ahead: %llu (%.0f s), %u of %u looked at", (unsigned long long)n, (runtime_now_ns() - t0) / 1e9, i + 1, g_pack_n);
+    }
+    remove(mine);
+    return NULL;
+}
+static void *watch_game(void *arg) {   // the child ends with the game
+    HANDLE g = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)(uintptr_t)arg);
+    if (g) WaitForSingleObject(g, INFINITE);
+    ExitProcess(3);
+    return NULL;
+}
+static void log_to_cache(void) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/shader-compile.log", cache_dir());
+    if (freopen(path, "a", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+}
+static int child_main(DWORD game) {
+    log_to_cache();
+    if (!vk_init(NULL)) return 2;
+    pthread_once(&g_pack_once, pack_open);
+    pthread_once(&g_bin_once, bin_open);
+    if (g_bin == INVALID_HANDLE_VALUE || !g_pack_n) return 2;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/bad-shaders.txt", cache_dir());
+    g_bad = read_file(path, &g_bad_n);
+    if (!g_bad) g_bad_n = 0;
+    pthread_t w;
+    if (game) pthread_create(&w, NULL, watch_game, (void *)(uintptr_t)game);
+    const char *e = getenv("TOTK_SHADER_COMPILE_THREADS");
+    int n = e && atoi(e) > 0 ? atoi(e) : 4;
+    pthread_t t[16];
+    if (n > 16) n = 16;
+    VLOG("compiling the shader pack ahead: %u shaders, %u with binaries, %zu skipped as bad, %d threads", g_pack_n, g_bin_n, g_bad_n / 65, n);
+    for (int i = 0; i < n; i++) pthread_create(&t[i], NULL, compile_thread, (void *)(intptr_t)i);
+    for (int i = 0; i < n; i++) pthread_join(t[i], NULL);
+    done_path(path, sizeof path);
+    FILE *f = fopen(path, "wb");
+    if (f) fclose(f);
+    VLOG("shader pack compiled ahead: %llu new binaries (%u kept in all)", (unsigned long long)atomic_load(&g_pack_made), g_bin_n);
+    return 0;
+}
+static int supervisor_main(DWORD game) {
+    log_to_cache();
+    HANDLE one = CreateMutexA(NULL, TRUE, "UltraTears-shader-compile");
+    if (!one || GetLastError() == ERROR_ALREADY_EXISTS) return 0;   // another one is at it
+    char exe[MAX_PATH], cmd[MAX_PATH + 64], path[1024];
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    for (int run = 0; run < 64; run++) {
+        snprintf(cmd, sizeof cmd, "\"%s\" --compile-shaders-child %lu", exe, (unsigned long)game);
+        STARTUPINFOA si = {sizeof si};
+        PROCESS_INFORMATION pi;
+        if (!CreateProcessA(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi)) return 1;
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        if (code == 0 || code == 2 || code == 3) return 0;   // done, nothing to do, or the game ended
+        fprintf(stderr, "[totk] shader compiler process ended with %#lx: the shaders it was compiling are skipped from now on\n", (unsigned long)code);
+        snprintf(path, sizeof path, "%s/bad-shaders.txt", cache_dir());
+        FILE *bad = fopen(path, "ab");
+        for (int i = 0; i < 16; i++) {
+            char mine[1024], key[80] = "";
+            snprintf(mine, sizeof mine, "%s/compiling-%d.txt", cache_dir(), i);
+            FILE *f = fopen(mine, "rb");
+            if (!f) continue;
+            if (fgets(key, sizeof key, f) && strlen(key) >= 64 && bad) { fprintf(bad, "%.64s\n", key); fprintf(stderr, "[totk]   %.64s\n", key); }
+            fclose(f);
+            remove(mine);
+        }
+        if (bad) fclose(bad);
+    }
+    return 1;
+}
+int vkb_shader_cache_main(int argc, char **argv) {
+    DWORD game = argc > 2 ? (DWORD)strtoul(argv[2], NULL, 10) : 0;
+    return !strcmp(argv[1], "--compile-shaders-child") ? child_main(game) : supervisor_main(game);
+}
+static void compile_ahead_start(void) {   // the game: start the supervisor while the pack is not through
+    const char *e = getenv("TOTK_SHADER_PREWARM");
+    char path[1024];
+    if (e && !strcmp(e, "list")) return;
+    done_path(path, sizeof path);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    char exe[MAX_PATH], cmd[MAX_PATH + 64];
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    snprintf(cmd, sizeof cmd, "\"%s\" --compile-shaders %lu", exe, (unsigned long)GetCurrentProcessId());
+    STARTUPINFOA si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    if (CreateProcessA(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        VLOG("shaders: the pack is compiled ahead by another process (log: %s/shader-compile.log)", cache_dir());
+    }
 }
 static void *prewarm_thread(void *unused) {
     (void)unused;
@@ -451,12 +747,13 @@ static void *prewarm_thread(void *unused) {
 static void prewarm_start(void) {
     const char *e = getenv("TOTK_SHADER_PREWARM");   // =0: shaders are made only when first drawn with (A/B)
     if (e && *e == '0') return;
+    compile_ahead_start();
     char path[1024];
     snprintf(path, sizeof path, "%s/used.txt", cache_dir());
     size_t n = 0;
-    if (!(g_list = read_file(path, &n))) return;
-    g_list_n = n;
-    VLOG("shader list: %zu shaders to make ahead", n / 67);
+    g_list = read_file(path, &n);   // none yet: the threads go straight to the pack (pack_compile)
+    g_list_n = g_list ? n : 0;
+    VLOG("shader list: %zu shaders to make ahead", g_list_n / 67);
     for (int i = 0; i < PREWARM_THREADS; i++) {
         pthread_t t;
         if (pthread_create(&t, NULL, prewarm_thread, NULL) == 0) pthread_detach(t);
@@ -479,13 +776,20 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     shentry *e = g_tab[h];
     while (e && strcmp(e->key, key)) e = e->next;
     if (!e) {
+        /* [Windows port] made outside g_mu: a compile no longer holds up the other recording threads' lookups (each
+           waited for every shader any thread was compiling). A thread wanting this shader meanwhile waits for it. */
         e = calloc(1, sizeof *e);
         if (!e) die("shader entry");
         memcpy(e->key, key, sizeof key);
         e->sh.key = e->key;
+        e->loading = 1;
+        e->next = g_tab[h];
+        g_tab[h] = e;
+        pthread_mutex_unlock(&g_mu);
         uint64_t t0 = runtime_now_ns();
         int ok = load(&e->sh, key, (int)stage);
-        vkb_shader_load_ns += runtime_now_ns() - t0;
+        __atomic_fetch_add(&vkb_shader_load_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&g_mu);
         if (ok) {
             g_loaded++;
             list_add(key, (int)stage);
@@ -494,9 +798,10 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
             e->sh.obj = VK_NULL_HANDLE;
             if (g_missing++ < 16) VLOG("shader %s (stage %u): no translation in %s", key, stage, cache_dir());
         }
-        e->next = g_tab[h];
-        g_tab[h] = e;
+        e->loading = 0;
+        pthread_cond_broadcast(&g_loaded_cv);
     }
+    while (e->loading) pthread_cond_wait(&g_loaded_cv, &g_mu);
     if (e->sh.obj && !e->c1_set) {   // loaded now or ahead (prewarm): the constants come with the game's program
         e->c1_set = 1;
         if (e->prewarmed) g_prewarm_hits++;

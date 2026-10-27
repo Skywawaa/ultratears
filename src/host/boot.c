@@ -86,6 +86,11 @@ static const char *default_exefs(void) {
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
+    if (argc >= 2 && !strncmp(argv[1], "--compile-shaders", 17)) {   // the shader pack compiled ahead (vkb_shader.c)
+        int vkb_shader_cache_main(int argc, char **argv);
+        default_exefs();   // the game folder and ultratears.cfg: where the shaders are
+        return vkb_shader_cache_main(argc, argv);
+    }
     if (argc > 2) { fprintf(stderr, "usage: UltraTears [exefs dir]\n"); return 2; }
     const char *exefs = argc == 2 ? argv[1] : default_exefs();
     plat_init();

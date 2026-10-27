@@ -779,12 +779,88 @@ static int to_bc7(vkb_image *im, int srgb, int fmt) {
 }
 typedef struct { const uint8_t *rows; uint8_t *rgba; vkb_bc7_key k; uint32_t level, layer, lw, lh, ld; int have, fmt; VkDeviceSize slice; } surf_t;
 static uint64_t g_bc7_images;   // images made BC7 (the log line)
+
+// ---- [Windows port] the surfaces of one texture in parallel: a big texture (a texture array of the world, an atlas) took
+// up to 0.5 s on one thread as each surface was deswizzled, hashed and read from the BC7 cache in turn (freezes when a
+// place is first seen, 2026-10-27). TOTK_TEX_THREADS helpers (default 4, 0: none) plus the calling thread share the
+// surfaces; one job at a time (uploads are serialised by g_up_mu).
+enum { PAR_MAX = 8 };
+static pthread_mutex_t g_par_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_par_cv = PTHREAD_COND_INITIALIZER, g_par_done_cv = PTHREAD_COND_INITIALIZER;
+static void (*g_par_fn)(void *, int);
+static void *g_par_ctx;
+static int g_par_n, g_par_left, g_par_threads = -1;
+static _Atomic int g_par_next;
+static uint64_t g_par_gen;
+static void par_work(void) {   // takes surfaces until none is left; the last one finished wakes the caller
+    for (int i; (i = atomic_fetch_add(&g_par_next, 1)) < g_par_n;) {
+        g_par_fn(g_par_ctx, i);
+        pthread_mutex_lock(&g_par_mu);
+        if (!--g_par_left) pthread_cond_signal(&g_par_done_cv);
+        pthread_mutex_unlock(&g_par_mu);
+    }
+}
+static void *par_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("totk-tex-upload");
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_par_mu);
+        while (g_par_gen == seen) pthread_cond_wait(&g_par_cv, &g_par_mu);
+        seen = g_par_gen;
+        pthread_mutex_unlock(&g_par_mu);
+        par_work();
+    }
+    return NULL;
+}
+static void par_for(int n, void (*fn)(void *, int), void *ctx) {
+    if (g_par_threads < 0) {
+        const char *e = getenv("TOTK_TEX_THREADS");
+        g_par_threads = e && *e ? atoi(e) : 4;
+        if (g_par_threads > PAR_MAX) g_par_threads = PAR_MAX;
+        for (int i = 0; i < g_par_threads; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, par_thread, NULL)) { g_par_threads = i; break; }
+            pthread_detach(t);
+        }
+    }
+    if (n < 2 || !g_par_threads) { for (int i = 0; i < n; i++) fn(ctx, i); return; }
+    pthread_mutex_lock(&g_par_mu);
+    g_par_fn = fn; g_par_ctx = ctx; g_par_n = n; g_par_left = n;
+    atomic_store(&g_par_next, 0);
+    g_par_gen++;
+    pthread_cond_broadcast(&g_par_cv);
+    pthread_mutex_unlock(&g_par_mu);
+    par_work();
+    pthread_mutex_lock(&g_par_mu);
+    while (g_par_left) pthread_cond_wait(&g_par_done_cv, &g_par_mu);
+    pthread_mutex_unlock(&g_par_mu);
+}
+
+typedef struct { surf_t *sf; const nvn_texdesc *d; const uint8_t *src; int bw, bh, srgb; const uint32_t *pitch; const VkDeviceSize *bytes; } astc_job;
+static void astc_find(void *ctx, int i) {   // deswizzle, hash and look up one surface
+    astc_job *j = ctx;
+    surf_t *s = &j->sf[i];
+    if (nvn_deswizzle(j->d, s->level, s->layer, j->src, (uint8_t *)s->rows, j->pitch[i])) { s->rows = NULL; return; }
+    s->k = vkb_bc7_key_of(s->rows, (size_t)j->bytes[i], s->lw, s->lh, s->ld, (uint32_t)j->bw, (uint32_t)j->bh, j->srgb);
+    size_t len;
+    s->have = vkb_bc7_lookup(s->k, &s->fmt, &len) &&
+              len == (s->fmt == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld));
+}
+typedef struct { surf_t *sf; uint8_t **blocks; size_t *n; int *ok; } read_job;
+static void bc_read_one(void *ctx, int i) {
+    read_job *j = ctx;
+    j->ok[i] = !j->sf[i].rows || vkb_bc7_read(j->sf[i].k, j->blocks[i], j->n[i]);
+}
+
 static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, int bw, int bh, int srgb) {
     const nvn_texdesc *d = &im->d;
     int ns = (int)(im->levels * im->layers), k = 0, all = 1, fmt = -1;
     surf_t *sf = calloc((size_t)(ns ? ns : 1), sizeof *sf);
-    if (!sf) die("ASTC surfaces");
-    for (uint32_t level = 0; level < im->levels; level++) {
+    uint32_t *pitches = calloc((size_t)(ns ? ns : 1), sizeof *pitches);
+    VkDeviceSize *sizes = calloc((size_t)(ns ? ns : 1), sizeof *sizes);
+    if (!sf || !pitches || !sizes) die("ASTC surfaces");
+    for (uint32_t level = 0; level < im->levels; level++) {   // the staging memory first (one thread), then the work in parallel
         uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
         uint32_t ld = im->depth >> level ? im->depth >> level : 1;
         uint32_t bx = (lw + bw - 1) / bw, by = (lh + bh - 1) / bh, pitch = bx * 16;
@@ -793,18 +869,21 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             VkBuffer buf;
             VkDeviceSize off;
             uint8_t *rows = vkb_ring_alloc(bytes, 16, &buf, &off);
-            surf_t *s = &sf[k];
-            *s = (surf_t){NULL, NULL, {0, 0}, level, layer, lw, lh, ld, 0, 0, slice};
-            if (nvn_deswizzle(d, level, layer, src, rows, pitch)) { all = 0; continue; }
-            s->rows = rows;
-            s->k = vkb_bc7_key_of(rows, (size_t)bytes, lw, lh, ld, (uint32_t)bw, (uint32_t)bh, srgb);
-            size_t len;
-            s->have = vkb_bc7_lookup(s->k, &s->fmt, &len) &&
-                      len == (s->fmt == VKB_BC_1 ? bc1_size(lw, lh, ld) : bc7_size(lw, lh, ld));
-            all &= s->have && (fmt < 0 || s->fmt == fmt);   // one format for the whole image
-            if (s->have && fmt < 0) fmt = s->fmt;
+            sf[k] = (surf_t){rows, NULL, {0, 0}, level, layer, lw, lh, ld, 0, 0, slice};
+            pitches[k] = pitch;
+            sizes[k] = bytes;
         }
     }
+    astc_job aj = {sf, d, src, bw, bh, srgb, pitches, sizes};
+    par_for(ns, astc_find, &aj);
+    for (int i = 0; i < ns; i++) {
+        const surf_t *s = &sf[i];
+        if (!s->rows) { all = 0; continue; }
+        all &= s->have && (fmt < 0 || s->fmt == fmt);   // one format for the whole image
+        if (s->have && fmt < 0) fmt = s->fmt;
+    }
+    free(pitches);
+    free(sizes);
     if (!im->bc7 && all && ns && to_bc7(im, srgb, fmt)) {
         g_bc7_images++;
         static int said;   // TOTK_BC7_LOG=1: every image made BC7 (development)
@@ -821,16 +900,29 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
                  (unsigned long long)im->serial, d->format, im->width, im->height, d->target, im->levels, im->layers, have, ns, (const void *)im->storage);
     }
     vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    if (im->bc7) {   // blocks from the cache (a surface missing from it: encoded now)
+    if (im->bc7) {   // blocks from the cache, read in parallel (a surface missing from it: encoded now)
         int bcf = im->bc7 == 2 ? VKB_BC_1 : VKB_BC_7;
+        uint8_t **blocks_of = calloc((size_t)ns, sizeof *blocks_of);
+        size_t *n_of = calloc((size_t)ns, sizeof *n_of);
+        int *ok_of = calloc((size_t)ns, sizeof *ok_of);
+        VkBuffer *buf_of = calloc((size_t)ns, sizeof *buf_of);
+        VkDeviceSize *off_of = calloc((size_t)ns, sizeof *off_of);
+        if (!blocks_of || !n_of || !ok_of || !buf_of || !off_of) die("BC7 surfaces");
         for (int i = 0; i < ns; i++) {
             surf_t *s = &sf[i];
             if (!s->rows) continue;
-            size_t n = bcf == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld);
-            VkBuffer buf;
-            VkDeviceSize off;
-            uint8_t *blocks = vkb_ring_alloc(n, 16, &buf, &off);
-            if (!vkb_bc7_read(s->k, blocks, n)) {
+            n_of[i] = bcf == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld);
+            blocks_of[i] = vkb_ring_alloc(n_of[i], 16, &buf_of[i], &off_of[i]);
+        }
+        read_job rj = {sf, blocks_of, n_of, ok_of};
+        par_for(ns, bc_read_one, &rj);
+        for (int i = 0; i < ns; i++) {
+            surf_t *s = &sf[i];
+            if (!s->rows) continue;
+            VkBuffer buf = buf_of[i];
+            VkDeviceSize off = off_of[i];
+            uint8_t *blocks = blocks_of[i];
+            if (!ok_of[i]) {
                 VkBuffer rb;
                 VkDeviceSize ro;
                 uint8_t *rgba = vkb_ring_alloc((VkDeviceSize)s->lw * s->lh * 4 * s->ld, 16, &rb, &ro);
@@ -844,6 +936,7 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             vkb_checkpoint("upload texture (BC7)", NULL, NULL);
             vk.vkCmdCopyBufferToImage(cb, buf, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         }
+        free(blocks_of); free(n_of); free(ok_of); free(buf_of); free(off_of);
     } else {   // decoded to RGBA8 (all surfaces together), then queued for encoding
         for (int i = 0; i < ns; i++) {
             surf_t *s = &sf[i];

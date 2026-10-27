@@ -12,6 +12,7 @@
 // transparent; half the bytes of BC7, and 12x12 ASTC holds less detail than BC1 keeps). Nothing from the game is
 // in the repository or a build: the cache is made on the player's machine from the player's copy (README.md, Legal).
 #include <direct.h>
+#include <io.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,12 +108,25 @@ int vkb_bc7_has(vkb_bc7_key k, size_t n) {
     int fmt; size_t len;
     return vkb_bc7_lookup(k, &fmt, &len) && fmt == VKB_BC_7 && len == n;
 }
+// [Windows port] The blocks are read with a positioned read outside g_mu, so the surfaces of one texture are read in
+// parallel (vkb_tex.c astc_upload); a record is in the index only after its blocks were flushed (vkb_bc_store).
 int vkb_bc7_read(vkb_bc7_key k, uint8_t *out, size_t n) {
     pthread_mutex_lock(&g_mu);
     int ok = open_files() && g_cap;
     rec_t r = {0};
     if (ok) { r = *slot(k.a, k.b); ok = (r.a || r.b) && r.len == n; }
-    if (ok) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
+    HANDLE h = ok ? (HANDLE)_get_osfhandle(_fileno(g_pack)) : INVALID_HANDLE_VALUE;
+    pthread_mutex_unlock(&g_mu);
+    for (size_t done = 0; ok && done < n;) {
+        OVERLAPPED o = {0};
+        uint64_t at = r.off + done;
+        o.Offset = (DWORD)at;
+        o.OffsetHigh = (DWORD)(at >> 32);
+        DWORD want = n - done > (1u << 30) ? 1u << 30 : (DWORD)(n - done), got = 0;
+        ok = ReadFile(h, out + done, want, &got, &o) && got;
+        done += got;
+    }
+    pthread_mutex_lock(&g_mu);
     if (ok) g_hits++; else g_misses++;
     pthread_mutex_unlock(&g_mu);
     return ok;
