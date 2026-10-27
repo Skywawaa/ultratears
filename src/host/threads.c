@@ -204,6 +204,7 @@ static void core_stats_tick(void) {   // TOTK_CORE_LOG: every 5 s, from whicheve
     uint64_t now = now_ns();
     if (now - g_core_stat_t0 < 5000000000ull) return;
     glock();
+    now = now_ns();   // after the lock: another thread may have just taken the stats (the span would wrap)
     if (now - g_core_stat_t0 < 5000000000ull) { pthread_mutex_unlock(&G); return; }
     uint64_t span = now - g_core_stat_t0, busy[MAXCORE], wns = g_core_wait_ns, wn = g_core_waits; int nwait = 0, nthr = 0;
     for (int i = 0; i < g_ncore; i++) {
@@ -241,6 +242,18 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     uint64_t w0 = g_core_log ? now_ns() : 0;
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < g_ncore; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    /* [Windows port] Spin handoff (MacNativeGames TOTK_SPIN_HANDOFF_US): a core is usually handed over within tens of
+       microseconds, about what waking a thread from the condition variable costs on Windows, and the title screen alone
+       makes ~2,200 such waits a second. Spin first with G released, then sleep. TOTK_SPIN_HANDOFF_US=<us> (default 0:
+       no measurable gain at the title screen, 2026-10-27; MacNativeGames uses 50). */
+    static int spin_us = -1;
+    if (spin_us < 0) { const char *e = getenv("TOTK_SPIN_HANDOFF_US"); spin_us = e && *e ? atoi(e) : 0; }
+    if (spin_us > 0) {
+        pthread_mutex_unlock(&G);
+        uint64_t until = now_ns() + (uint64_t)spin_us * 1000;
+        while (__atomic_load_n(&t->cur_core, __ATOMIC_ACQUIRE) < 0 && now_ns() < until) __builtin_ia32_pause();
+        glock();
+    }
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
     if (g_core_log) { g_core_wait_ns += now_ns() - w0; g_core_waits++; }
 }
