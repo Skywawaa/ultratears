@@ -32,7 +32,51 @@ static float *g_ft;   // frame times (ms) of the measured run
 static size_t g_nft, g_capft;
 static volatile float g_angle;   // the camera's turn (radians), read by bench_cam
 
+/* TOTK_AUTOLOAD=1 (a reproduction of something in play, without a person): the same loading as the benchmark, then
+   TOTK_AUTOLOAD_KEYS="<seconds>:<key>:<ms held>,..." (seconds after the world is there; keys named as on the keyboard,
+   A-Z / SPACE / RETURN / UP / DOWN / LEFT / RIGHT) and, with TOTK_AUTOLOAD_EXIT=<seconds>, the game quits then. */
+static int g_autoload;
+static const char *g_keys;
+static double g_exit_after;
+static int key_code(const char *k, size_t n) {
+    static const int letters[26] = {0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6};
+    static const struct { const char *name; int code; } named[] = {{"RETURN", 36}, {"SPACE", 49}, {"UP", 126}, {"DOWN", 125},
+                                                                    {"LEFT", 123}, {"RIGHT", 124}, {"LSHIFT", 56}, {"ESCAPE", 53}};
+    if (n == 1 && k[0] >= 'A' && k[0] <= 'Z') return letters[k[0] - 'A'];
+    for (unsigned i = 0; i < sizeof named / sizeof *named; i++) if (strlen(named[i].name) == n && !strncmp(named[i].name, k, n)) return named[i].code;
+    return -1;
+}
+static void keys_tick(double t) {   // presses and releases due at t seconds into the world
+    static double last = -1;
+    for (const char *p = g_keys; p && *p;) {
+        double at = atof(p);
+        const char *k = strchr(p, ':');
+        if (!k) break;
+        k++;
+        size_t n = strcspn(k, ":,");
+        double ms = k[n] == ':' ? atof(k + n + 1) : 150;
+        int code = key_code(k, n);
+        if (code >= 0) {
+            if (at > last && at <= t) { fprintf(stderr, "[autoload] %.1f s: %.*s down\n", t, (int)n, k); runtime_input_key((unsigned)code, 1); }
+            if (at + ms / 1000 > last && at + ms / 1000 <= t) { fprintf(stderr, "[autoload] %.1f s: %.*s up\n", t, (int)n, k); runtime_input_key((unsigned)code, 0); }
+        }
+        p = strchr(k, ',');
+        if (p) p++;
+    }
+    last = t;
+}
+
 __attribute__((constructor)) static void bench_configure(void) {
+    const char *a = getenv("TOTK_AUTOLOAD");
+    if (a && *a == '1') {
+        g_autoload = 1;
+        g_keys = getenv("TOTK_AUTOLOAD_KEYS");
+        const char *x = getenv("TOTK_AUTOLOAD_EXIT");
+        g_exit_after = x && *x ? atof(x) : 0;
+        g_state = B_WAIT_SAVE;
+        fprintf(stderr, "[autoload] on: the newest save of the profile is loaded, then the key script runs\n");
+        return;
+    }
     const char *e = getenv("TOTK_BENCH");
     if (!e || !*e || !strcmp(e, "0")) return;
     g_seconds = atof(e);
@@ -119,7 +163,17 @@ void runtime_bench_frame(uint64_t now) {
     }
     if (st == B_LOADING) {
         g_steady = ms > 0 && ms < 100 ? g_steady + 1 : 0;
-        if (g_steady >= 120) { g_state = B_WARMUP; g_phase_t0 = now; fprintf(stderr, "[bench] in the world: %.0f s of warm-up\n", g_warmup); }
+        if (g_steady >= 120) {
+            g_state = g_autoload ? B_RUN : B_WARMUP; g_phase_t0 = now;
+            if (g_autoload) fprintf(stderr, "[autoload] in the world\n");
+            else fprintf(stderr, "[bench] in the world: %.0f s of warm-up\n", g_warmup);
+        }
+        return;
+    }
+    if (g_autoload) {   // the key script, then (TOTK_AUTOLOAD_EXIT) the end
+        double t = (now - g_phase_t0) / 1e9;
+        keys_tick(t);
+        if (g_exit_after > 0 && t >= g_exit_after) { fprintf(stderr, "[autoload] done after %.0f s\n", t); fflush(stderr); _Exit(0); }
         return;
     }
     if (st == B_WARMUP) {
@@ -155,7 +209,7 @@ void runtime_bench_frame(uint64_t now) {
 static double getd(const Cpu *c, int n) { uint64_t b = (uint64_t)c->v[n]; double d; memcpy(&d, &b, 8); return d; }
 static void setd(Cpu *c, int n, double d) { uint64_t b; memcpy(&b, &d, 8); c->v[n] = b; }
 void totk_bench_cam(Cpu *c) {
-    if (g_state != B_RUN) return;
+    if (g_state != B_RUN || g_autoload) return;
     double ex = getd(c, 1), ey = getd(c, 2), ez = getd(c, 0), tx = getd(c, 3), tz = getd(c, 5);
     double a = g_angle, dx = ex - tx, dz = ez - tz;
     double nx = tx + dx * cos(a) - dz * sin(a), nz = tz + dx * sin(a) + dz * cos(a);

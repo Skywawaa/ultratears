@@ -63,6 +63,7 @@ typedef struct vkb_image {
     int stale;                     // that check found CPU writes: upload before the next use
     int cpu_written;               // WriteTexels changed its game memory: upload before the next use (any pool)
     int not_uploadable;            // contents in game memory that the upload cannot take (depth / 3-component formats)
+    int copy_logged;               // TOTK_COPY_LOG: buffer <-> texture copies of this texture logged so far (vkb_copy.c)
     uint64_t vpool_gen;            // in a virtual pool: the mapping generation of the last upload (0: not in one)
     const uint8_t *storage;        // the texture's storage in game memory (block-linear / linear)
     uint64_t write_seq;            // vkb_image_written: when the GPU last wrote it (0 = never)
@@ -90,6 +91,7 @@ void vkb_mirrors_submit(VkCommandBuffer cb);           // end of a submission: a
 
 // ---- backend_vk.c / vkb_shadow.c: copies of the memory pools in device memory (discrete GPUs)
 void vkb_pool_use(uint64_t addr, uint64_t len, int write);   // before a GPU access is recorded (write: may end the pass)
+void vkb_pool_refresh(uint64_t addr, uint64_t len);          // a range's device copy taken from game memory again (copies into textures)
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // the copy when current, else game memory
 int vkb_shadow_on(void);
 uint32_t vkb_shadow_alloc(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);   // 0: none

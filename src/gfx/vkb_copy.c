@@ -76,11 +76,24 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
     vkb_pass_end_r(PE_TEXCOPY);
     vkb_mirrors_evict(c->src, len);   // a range that straddles a mirror: game memory first
     vkb_pool_use(c->src, len, !to_tex);
+    if (to_tex) vkb_pool_refresh(c->src, len);   // [temporary] the source as the CPU last wrote it (backend_vk.c)
     if (!to_tex) vkb_ucap_drop(c->src, len);
     VkBuffer buf;
     VkDeviceSize off;
     if (!vkb_gpu_addr(c->src, len, &buf, &off)) { vkb_audit(A_COPY_SKIPPED, NULL); return; }
     if (off % (bpb < 4 ? 4 : bpb)) { unsupported(what, im); return; }   // [temporary] Vulkan's buffer offset alignment
+    {   // TOTK_COPY_LOG=1 (development): the first buffer <-> texture copies of each texture, as replayed
+        static int on = -1, said;
+        if (on < 0) on = getenv("TOTK_COPY_LOG") != NULL;
+        if (on && said < 400 && im->copy_logged < 3) {
+            said++; im->copy_logged++;
+            VLOG("[copy] %s: texture %llu format %#x %ux%u levels %u layers %u, region %d,%d %dx%d z%d+%d, level %u layer %u, "
+                 "stride %lld (row %llu bytes of %llu), %llu bytes from %#llx (buffer offset %llu)", to_tex ? "b2t" : "t2b",
+                 (unsigned long long)im->serial, im->d.format, im->width, im->height, im->levels, im->layers, c->r.xoffset, c->r.yoffset,
+                 c->r.width, c->r.height, c->r.zoffset, nz, level, layer0, (long long)g_stride, (unsigned long long)row,
+                 (unsigned long long)wb, (unsigned long long)len, (unsigned long long)c->src, (unsigned long long)off);
+        }
+    }
     VkCommandBuffer cb = vkb_cmd();
     vkb_tex_upload(cb, im);   // the texture's current contents (the source, or the rest of the destination)
     VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),

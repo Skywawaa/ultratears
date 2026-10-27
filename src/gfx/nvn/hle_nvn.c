@@ -863,11 +863,19 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
 #define COPY_TOKEN_MAGIC 0x4e454b4f54594d43ull
 extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarded read of guest memory survives a fault
 static int async_replay(void);   /* below: TOTK_ASYNC_REPLAY */
-/* With the translation thread (TOTK_ASYNC_REPLAY=1, iPhone default) the game may reuse a submitted command buffer's control
-   memory as soon as the submit call returns, before the queued replay used the copy: marks are not used there yet (a copy
-   last submitted at or after the submission being replayed would have to be kept). */
-static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && !async_replay();
-    if (!v) LOG("[cmd] recording-copy stamps: off (%s); copies are released only when control memory is re-added", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "not supported by the translation thread yet"); } return v; }
+/* With the translation thread (TOTK_ASYNC_REPLAY=1, the Windows default) the game may reuse a submitted command buffer's
+   control memory as soon as the submit call returns, before the queued replay used the copy. [Windows port] Marks are used
+   there too: a copy whose mark is gone is released only once the submissions that used it have been replayed
+   (copy_replayed). Without marks, copies whose control memory the game gave back to its heap were never released: 2,400 ->
+   71,600 live copies in a 15-minute session (2026-10-27), as MacNativeGames measured before marks (88,000 -> 483,000). */
+static uint64_t x_replayed(void);   /* below: the submissions the translation thread has replayed (UINT64_MAX: synchronous) */
+static int copy_replayed(const cmd_copy *c) {
+    const copy_prefix *pf = (const copy_prefix *)(c->copy - sizeof(copy_prefix));
+    uint64_t used = atomic_load_explicit(&pf->used_at, memory_order_relaxed), done = x_replayed();
+    return done == UINT64_MAX || used + 16 <= done;   /* a margin: submit numbers and replay job numbers are counted apart */
+}
+static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0"));
+    if (!v) LOG("[cmd] recording-copy stamps: off (TOTK_COPY_TOKEN=0); copies are released only when control memory is re-added"); } return v; }
 static void copy_token_write(uintptr_t at, const uint8_t *copy) { uint64_t v[2] = {COPY_TOKEN_MAGIC, (uint64_t)(uintptr_t)copy}; memcpy((void *)at, v, sizeof v); }
 static int copy_token_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 22; } return v; }   /* probe negative 22: marks never checked */
 /* Reading a mark (pin_scan): the fault guard is armed only around the 16-byte read; the jump buffer is set once per walked
@@ -1157,12 +1165,16 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
     size_t end = g_pin_scan_pos + buckets < g_pin_scan_cap ? g_pin_scan_pos + buckets : g_pin_scan_cap;
     volatile size_t k = g_pin_scan_pos; volatile uint32_t i = 0;
     sigjmp_buf jb;
-    if (sigsetjmp(jb, 1)) { runtime_fault_guard = NULL; copy_drop(&g_cbk[k], i, 1); g_copy_mark_faults++; }   /* reading copy (k, i)'s mark faulted: its control memory is unmapped */
+    if (sigsetjmp(jb, 1)) {   /* reading copy (k, i)'s mark faulted: its control memory is unmapped */
+        runtime_fault_guard = NULL;
+        if (copy_replayed(&g_cbk[k].v[i])) { copy_drop(&g_cbk[k], i, 1); g_copy_mark_faults++; }
+        else { pin_mark_ops(g_cbk[k].v[i].copy); g_pin_scanned++; i++; }   /* a queued replay still reads it: kept until then */
+    }
     g_mark_jb = &jb;
     for (; k < end; k++, i = 0) {
         copy_bucket *b = &g_cbk[k]; if (!b->used) continue;
         while (i < b->n) {
-            if (b->v[i].token && !copy_token_intact(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
+            if (b->v[i].token && !copy_token_intact(&b->v[i]) && copy_replayed(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused (and its replays are done): the copy goes */
             pin_mark_ops(b->v[i].copy); g_pin_scanned++; i++;
         }
     }
@@ -1955,7 +1967,8 @@ static void x_drain(void) {   // everything queued so far has run (no-op when sy
     uint64_t t0 = now_ns(); x_wait_job(want);
     atomic_fetch_add(&g_x_drains, 1); atomic_fetch_add(&g_x_drain_ns, now_ns() - t0);
 }
-void nvn_x_drain(void) { x_drain(); }   // for the graphics layer (pool invalidate write-back)
+void nvn_x_drain(void) { x_drain(); }
+static uint64_t x_replayed(void) { return async_replay() ? __atomic_load_n(&g_xsub_done, __ATOMIC_ACQUIRE) : UINT64_MAX; }   // for the graphics layer (pool invalidate write-back)
 // Fence token for FenceSync: submits enqueued so far (async) or the Metal fence (synchronous).
 static uint64_t fence_now(int *token) {
     if (!async_replay()) { *token = 0; return mtl_last_fence(); }

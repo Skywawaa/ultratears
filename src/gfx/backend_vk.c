@@ -505,6 +505,23 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     }
     vkb_rw_write_end(&g_pool_mu);
 }
+/* [Windows port] The source of a copy into a texture brought up to date from game memory whatever the write tracking
+   says, unless the GPU wrote the pool's copy more recently (its writes not yet back in game memory). A pre-rendered
+   cutscene's NV12 frames (written by the host's decoder, movie_host.c) are copied into the movie's luma and chroma
+   textures this way; the tracking missed the chroma rows' writes and the cutscene showed in grey with a coloured band at
+   the top (2026-10-27, the first memory with Zelda; right with TOTK_VK_POOL_SHADOW=0). [temporary] until that is found. */
+void vkb_pool_refresh(uint64_t addr, uint64_t len) {
+    if (g_ok != 1 || !addr || !len || !vkb_shadow_on()) return;
+    vkb_rw_write(&g_pool_mu, LK_POOLS);
+    pool_ent *p = pool_find_mut((uintptr_t)addr, len);
+    int gpu_newer = p && p->wb_sub && (p->wb_sub > g_fence || !mtl_wait(p->wb_sub, 0));
+    if (p && p->sh && p->filled && !gpu_newer) {
+        VkDeviceSize o = (VkDeviceSize)(addr - p->base);
+        run_put(p->buf, p->sbuf, o, p->soff + o, len);
+        sync_flush();
+    }
+    vkb_rw_write_end(&g_pool_mu);
+}
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (g_ok != 1) return 0;
     vkb_rw_read(&g_pool_mu, LK_POOLS);
