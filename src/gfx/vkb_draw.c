@@ -91,8 +91,13 @@ void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDevice
             continue;
         }
         if (r->n == 32) die("upload memory: 32 chunks (2 GiB) in one submission");
+        uint64_t t0 = runtime_now_ns();
         if (!chunk_new(&r->c[r->n], n > (64u << 20) ? n : (64u << 20))) die("upload memory");
         r->n++;
+        uint64_t ms = (runtime_now_ns() - t0) / 1000000;
+        static int said;
+        if (ms >= 5 && said++ < 100) LOG("[vk] upload memory: chunk %d of slot %d / thread %d made in %llu ms (%llu MiB)", r->n, vkb_slot(),
+                                         vkb_worker(), (unsigned long long)ms, (unsigned long long)(r->c[r->n - 1].size >> 20));
     }
 }
 

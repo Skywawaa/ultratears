@@ -35,7 +35,8 @@ static volatile float g_angle;   // the camera's turn (radians), read by bench_c
 /* TOTK_AUTOLOAD=1 (a reproduction of something in play, without a person): the same loading as the benchmark, then
    TOTK_AUTOLOAD_KEYS="<seconds>:<key>:<ms held>,..." (seconds after the world is there; keys named as on the keyboard,
    A-Z / SPACE / RETURN / UP / DOWN / LEFT / RIGHT) and, with TOTK_AUTOLOAD_EXIT=<seconds>, the game quits then. */
-static int g_autoload;
+static int g_autoload, g_orbit = 1;
+static uint64_t g_world_t0;   // when the world was there (the key script's clock)
 static const char *g_keys;
 static double g_exit_after;
 static int key_code(const char *k, size_t n) {
@@ -81,6 +82,9 @@ __attribute__((constructor)) static void bench_configure(void) {
     if (!e || !*e || !strcmp(e, "0")) return;
     g_seconds = atof(e);
     if (g_seconds < 5 || g_seconds > 3600) g_seconds = 60;
+    g_keys = getenv("TOTK_BENCH_KEYS");   // keys pressed at given seconds after the world is there (an event to start)
+    const char *o = getenv("TOTK_BENCH_ORBIT");
+    g_orbit = !(o && *o == '0');           // 0: the game's own camera (a scene that plays by itself)
     const char *w = getenv("TOTK_BENCH_WARMUP");
     if (w && *w) g_warmup = atof(w);
     g_state = B_WAIT_SAVE;
@@ -164,7 +168,7 @@ void runtime_bench_frame(uint64_t now) {
     if (st == B_LOADING) {
         g_steady = ms > 0 && ms < 100 ? g_steady + 1 : 0;
         if (g_steady >= 120) {
-            g_state = g_autoload ? B_RUN : B_WARMUP; g_phase_t0 = now;
+            g_state = g_autoload ? B_RUN : B_WARMUP; g_phase_t0 = g_world_t0 = now;
             if (g_autoload) fprintf(stderr, "[autoload] in the world\n");
             else fprintf(stderr, "[bench] in the world: %.0f s of warm-up\n", g_warmup);
         }
@@ -176,6 +180,7 @@ void runtime_bench_frame(uint64_t now) {
         if (g_exit_after > 0 && t >= g_exit_after) { fprintf(stderr, "[autoload] done after %.0f s\n", t); fflush(stderr); _Exit(0); }
         return;
     }
+    if (!g_autoload && g_keys) keys_tick((now - g_world_t0) / 1e9);   // TOTK_BENCH_KEYS
     if (st == B_WARMUP) {
         if ((now - g_phase_t0) / 1e9 >= g_warmup) { g_state = B_RUN; g_phase_t0 = now; g_nft = 0; fprintf(stderr, "[bench] measuring %.0f s\n", g_seconds); }
         return;
@@ -193,7 +198,7 @@ void runtime_bench_frame(uint64_t now) {
     }
     if (g_nft == g_capft) { g_capft = g_capft ? g_capft * 2 : 65536; g_ft = realloc(g_ft, g_capft * sizeof *g_ft); if (!g_ft) { g_state = B_DONE; return; } }
     if (ms > 0) g_ft[g_nft++] = (float)ms;
-    g_angle = (float)(2 * M_PI * t / g_seconds);
+    g_angle = g_orbit ? (float)(2 * M_PI * t / g_seconds) : 0;
     if (t >= g_seconds) {
         g_state = B_DONE;
         report();

@@ -4,6 +4,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "host.h"
 #include "version.h"   // build/version.h (tools/build_game.py, tools/version.py)
@@ -83,6 +84,39 @@ static const char *default_exefs(void) {
     return exefs;
 }
 
+/* [Windows port] The log goes to logs\ultratears-<date>-<time>.log in the game folder when nothing else takes it (the game
+   started from Explorer or a shortcut), so that a crash in play leaves its report; the 10 newest are kept. A launcher or
+   a redirect that takes stderr keeps it. TOTK_LOG=0: no file. */
+static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void start_log(void) {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
+    const char *e = getenv("TOTK_LOG");
+    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE || (e && *e == '0')) return;
+    CreateDirectoryA("logs", NULL);
+    char *names[256];
+    int n = 0;
+    WIN32_FIND_DATAA d;
+    HANDLE f = FindFirstFileA("logs\\ultratears-*.log", &d);
+    if (f != INVALID_HANDLE_VALUE) {
+        do if (n < 256) names[n++] = _strdup(d.cFileName); while (FindNextFileA(f, &d));
+        FindClose(f);
+    }
+    qsort(names, (size_t)n, sizeof *names, name_cmp);
+    for (int i = 0; i < n; i++) {
+        if (i < n - 9) { char p[MAX_PATH]; snprintf(p, sizeof p, "logs\\%s", names[i]); DeleteFileA(p); }
+        free(names[i]);
+    }
+    char name[64];
+    time_t now = time(NULL);
+    strftime(name, sizeof name, "logs\\ultratears-%Y%m%d-%H%M%S.log", localtime(&now));
+    if (!freopen(name, "w", stderr)) return;
+    setvbuf(stderr, NULL, _IONBF, 0);
+    fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);
+#endif
+}
+
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
@@ -93,6 +127,7 @@ int main(int argc, char **argv) {
     }
     if (argc > 2) { fprintf(stderr, "usage: UltraTears [exefs dir]\n"); return 2; }
     const char *exefs = argc == 2 ? argv[1] : default_exefs();
+    start_log();   // in the game folder (default_exefs entered it)
     plat_init();
     plat_crash_handler_install();
     plat_cpu_placement();

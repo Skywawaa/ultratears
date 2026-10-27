@@ -195,7 +195,7 @@ static int create_device(void) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
         if ((want[i].flag == &has_pid || want[i].flag == &has_ll2) && (!vkc.surface || (getenv("TOTK_REFLEX") && !atoi(getenv("TOTK_REFLEX"))))) continue;
         if (want[i].flag == &has_ll2 && !ext_in(&ex, VK_KHR_PRESENT_ID_EXTENSION_NAME)) continue;
-        if (want[i].flag == &vkc.has_checkpoints && !getenv("TOTK_VK_CHECKPOINTS")) continue;
+        if (want[i].flag == &vkc.has_checkpoints && getenv("TOTK_VK_CHECKPOINTS") && *getenv("TOTK_VK_CHECKPOINTS") == '0') continue;   // [Windows port] on by default: a lost device names its last draw
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
         if (want[i].flag) *want[i].flag = 1;

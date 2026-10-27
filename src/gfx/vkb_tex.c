@@ -855,8 +855,13 @@ typedef struct { surf_t *sf; const nvn_texdesc *d; const uint8_t *src; int bw, b
 static void astc_find(void *ctx, int i) {   // deswizzle, hash and look up one surface
     astc_job *j = ctx;
     surf_t *s = &j->sf[i];
-    if (nvn_deswizzle(j->d, s->level, s->layer, j->src, (uint8_t *)s->rows, j->pitch[i])) { s->rows = NULL; return; }
-    s->k = vkb_bc7_key_of(s->rows, (size_t)j->bytes[i], s->lw, s->lh, s->ld, (uint32_t)j->bw, (uint32_t)j->bh, j->srgb);
+    /* [Windows port] deswizzled and hashed in host memory, then copied into the ring in one go: the ring is write-combined
+       device memory, and hashing it read it back at a crawl */
+    uint8_t *tmp = malloc((size_t)j->bytes[i]);
+    if (!tmp || nvn_deswizzle(j->d, s->level, s->layer, j->src, tmp, j->pitch[i])) { free(tmp); s->rows = NULL; return; }
+    s->k = vkb_bc7_key_of(tmp, (size_t)j->bytes[i], s->lw, s->lh, s->ld, (uint32_t)j->bw, (uint32_t)j->bh, j->srgb);
+    memcpy((uint8_t *)s->rows, tmp, (size_t)j->bytes[i]);
+    free(tmp);
     size_t len;
     s->have = vkb_bc7_lookup(s->k, &s->fmt, &len) &&
               len == (s->fmt == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld));
@@ -872,7 +877,129 @@ static void bc_read_one(void *ctx, int i) {
     j->ok[i] = !j->sf[i].rows || vkb_bc7_read(j->sf[i].k, j->blocks[i], j->n[i]);
 }
 
-static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, int bw, int bh, int srgb) {
+/* ---- [Windows port] The texture map (<TOTK_BC7_DIR>/texmap.bin): a fingerprint of a texture's bytes as the game holds
+   them (swizzled) -> the cache keys of its surfaces. Finding the keys meant deswizzling and hashing every surface: 1.9 s
+   for a 1024x1024 texture array of 121 layers and 11 levels (freezes when a place is first seen, 2026-10-27). The first
+   time a texture is seen its keys are worked out as before and kept here; after that its bytes are fingerprinted in
+   parallel (a few ms) and its BC7 blocks read straight from the cache. Layout: "UTTXMP01", then records
+   {u64 fingerprint[2]; u32 surfaces; u32 0; surfaces x u64 key[2]}. TOTK_TEXMAP=0: off. */
+typedef struct { vkb_bc7_key fp; uint32_t ns; vkb_bc7_key *keys; } tm_ent;
+static tm_ent *g_tm;               // open addressing, power-of-two capacity
+static uint32_t g_tm_cap, g_tm_n;
+static FILE *g_tm_file;
+static int g_tm_state;             // 0 not opened, 1 open, -1 off
+static pthread_mutex_t g_tm_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_tm_hits, g_tm_new;
+static tm_ent *tm_slot(vkb_bc7_key fp) {   // g_tm_mu held
+    for (uint32_t i = (uint32_t)(fp.a ^ fp.b) & (g_tm_cap - 1);; i = (i + 1) & (g_tm_cap - 1))
+        if (!g_tm[i].ns || (g_tm[i].fp.a == fp.a && g_tm[i].fp.b == fp.b)) return &g_tm[i];
+}
+static void tm_insert(vkb_bc7_key fp, uint32_t ns, vkb_bc7_key *keys) {   // g_tm_mu held; keys taken over
+    if (2 * (g_tm_n + 1) > g_tm_cap) {
+        uint32_t oc = g_tm_cap; tm_ent *old = g_tm;
+        g_tm_cap = oc ? oc * 2 : 1u << 14;
+        if (!(g_tm = calloc(g_tm_cap, sizeof *g_tm))) die("texture map");
+        for (uint32_t i = 0; i < oc; i++) if (old[i].ns) *tm_slot(old[i].fp) = old[i];
+        free(old);
+    }
+    tm_ent *e = tm_slot(fp);
+    if (e->ns) { free(keys); return; }
+    *e = (tm_ent){fp, ns, keys};
+    g_tm_n++;
+}
+static void tm_open(void) {   // g_tm_mu held
+    const char *off = getenv("TOTK_TEXMAP");
+    if (off && *off == '0') { g_tm_state = -1; return; }
+    const char *d = getenv("TOTK_BC7_DIR");
+    char path[512];
+    snprintf(path, sizeof path, "%s/texmap.bin", d && *d ? d : "data/textures");
+    g_tm_state = -1;
+    if (!(g_tm_file = fopen(path, "r+b")) && !(g_tm_file = fopen(path, "w+b"))) { VLOG("texture map: cannot open %s", path); return; }
+    char hd[8];
+    long good = 8;
+    if (fread(hd, 1, 8, g_tm_file) != 8 || memcmp(hd, "UTTXMP01", 8)) {
+        fseek(g_tm_file, 0, SEEK_SET);
+        fwrite("UTTXMP01", 1, 8, g_tm_file);
+        fflush(g_tm_file);
+    } else {
+        for (;;) {
+            uint64_t h[2]; uint32_t n[2];
+            if (fread(h, 8, 2, g_tm_file) != 2 || fread(n, 4, 2, g_tm_file) != 2 || !n[0] || n[0] > 65536) break;
+            vkb_bc7_key *keys = malloc(sizeof *keys * n[0]);
+            if (!keys || fread(keys, sizeof *keys, n[0], g_tm_file) != n[0]) { free(keys); break; }   // a record cut short
+            tm_insert((vkb_bc7_key){h[0], h[1]}, n[0], keys);
+            good = ftell(g_tm_file);
+        }
+    }
+    fseek(g_tm_file, good, SEEK_SET);
+    g_tm_state = 1;
+    VLOG("texture map %s: %u textures", path, g_tm_n);
+}
+static int tm_get(vkb_bc7_key fp, surf_t *sf, int ns) {   // 1: every surface's key filled in
+    pthread_mutex_lock(&g_tm_mu);
+    if (!g_tm_state) tm_open();
+    int ok = 0;
+    if (g_tm_state > 0 && g_tm_cap) {
+        tm_ent *e = tm_slot(fp);
+        if (e->ns == (uint32_t)ns) { for (int i = 0; i < ns; i++) sf[i].k = e->keys[i]; ok = 1; g_tm_hits++; }
+    }
+    pthread_mutex_unlock(&g_tm_mu);
+    return ok;
+}
+static void tm_put(vkb_bc7_key fp, const surf_t *sf, int ns) {
+    vkb_bc7_key *keys = malloc(sizeof *keys * (size_t)ns);
+    if (!keys) return;
+    for (int i = 0; i < ns; i++) keys[i] = sf[i].k;
+    pthread_mutex_lock(&g_tm_mu);
+    if (!g_tm_state) tm_open();
+    if (g_tm_state > 0 && !(g_tm_cap && tm_slot(fp)->ns)) {
+        uint64_t h[2] = {fp.a, fp.b}; uint32_t n[2] = {(uint32_t)ns, 0};
+        if (fwrite(h, 8, 2, g_tm_file) == 2 && fwrite(n, 4, 2, g_tm_file) == 2 && fwrite(keys, sizeof *keys, (size_t)ns, g_tm_file) == (size_t)ns) {
+            fflush(g_tm_file);
+            tm_insert(fp, (uint32_t)ns, keys);
+            keys = NULL;
+            if (++g_tm_new % 500 == 0) VLOG("texture map: %llu textures added this run, %llu found in it", (unsigned long long)g_tm_new, (unsigned long long)g_tm_hits);
+        }
+    }
+    pthread_mutex_unlock(&g_tm_mu);
+    free(keys);
+}
+// The fingerprint: four independent lanes over 32-byte steps, in 8 MiB chunks on the helper threads, then the chunks'
+// results mixed in order with the texture's description.
+#define FP_CHUNK (8u << 20)
+typedef struct { const uint8_t *p; size_t n; uint64_t *h; } fp_job;
+static uint64_t fp_rotl(uint64_t x, int r) { return x << r | x >> (64 - r); }
+static uint64_t fp_fin(uint64_t h) { h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 33; return h; }
+static void fp_chunk(void *ctx, int i) {
+    fp_job *j = ctx;
+    size_t o = (size_t)i * FP_CHUNK, n = j->n - o < FP_CHUNK ? j->n - o : FP_CHUNK, k = 0;
+    const uint8_t *p = j->p + o;
+    const uint64_t M = 0x9E3779B97F4A7C15ull;
+    uint64_t a = 0x243F6A8885A308D3ull, b = 0x13198A2E03707344ull, c = 0xA4093822299F31D0ull, e = 0x082EFA98EC4E6C89ull;
+    for (; k + 32 <= n; k += 32) {
+        uint64_t x[4];
+        memcpy(x, p + k, 32);
+        a = fp_rotl(a ^ x[0] * M, 31) * M; b = fp_rotl(b ^ x[1] * M, 29) * M;
+        c = fp_rotl(c ^ x[2] * M, 27) * M; e = fp_rotl(e ^ x[3] * M, 25) * M;
+    }
+    for (; k < n; k++) a = fp_rotl(a ^ p[k] * M, 31) * M;
+    j->h[2 * i] = fp_fin(a ^ fp_rotl(c, 17) ^ n);
+    j->h[2 * i + 1] = fp_fin(b ^ fp_rotl(e, 23) ^ (uint64_t)i);
+}
+static vkb_bc7_key raw_fingerprint(const uint8_t *src, size_t n, const vkb_image *im, int srgb) {
+    int nc = (int)((n + FP_CHUNK - 1) / FP_CHUNK);
+    uint64_t *h = calloc((size_t)(nc ? nc : 1) * 2, sizeof *h);
+    if (!h) die("texture fingerprint");
+    fp_job j = {src, n, h};
+    par_for(nc, fp_chunk, &j);
+    uint64_t a = fp_fin((uint64_t)im->width << 32 | im->height) ^ im->d.format, b = fp_fin((uint64_t)im->levels << 32 | im->layers) ^ ((uint64_t)srgb << 40 | im->depth);
+    for (int i = 0; i < nc; i++) { a = fp_fin(a ^ h[2 * i]); b = fp_fin(b ^ h[2 * i + 1] ^ a); }
+    free(h);
+    vkb_bc7_key k = {fp_fin(a ^ n), fp_fin(b ^ (n << 1))};
+    return k;
+}
+
+static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, size_t src_len, int bw, int bh, int srgb) {
     const nvn_texdesc *d = &im->d;
     int ns = (int)(im->levels * im->layers), k = 0, all = 1, fmt = -1;
     surf_t *sf = calloc((size_t)(ns ? ns : 1), sizeof *sf);
@@ -895,16 +1022,34 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
     }
     astc_job aj = {sf, d, src, bw, bh, srgb, pitches, sizes};
     uint64_t tf = runtime_now_ns();
-    par_for(ns, astc_find, &aj);
-    g_up_find_ns += runtime_now_ns() - tf;
-    for (int i = 0; i < ns; i++) {
-        const surf_t *s = &sf[i];
-        if (!s->rows) { all = 0; continue; }
-        all &= s->have && (fmt < 0 || s->fmt == fmt);   // one format for the whole image
-        if (s->have && fmt < 0) fmt = s->fmt;
+    vkb_bc7_key fp = raw_fingerprint(src, src_len, im, srgb);
+    int mapped = tm_get(fp, sf, ns);   // the keys without deswizzling (the rows are filled only if needed below)
+    if (mapped)
+        for (int i = 0; i < ns; i++) {
+            surf_t *s = &sf[i];
+            size_t len;
+            s->have = vkb_bc7_lookup(s->k, &s->fmt, &len) &&
+                      len == (s->fmt == VKB_BC_1 ? bc1_size(s->lw, s->lh, s->ld) : bc7_size(s->lw, s->lh, s->ld));
+            all &= s->have && (fmt < 0 || s->fmt == fmt);
+            if (s->have && fmt < 0) fmt = s->fmt;
+        }
+    if (!mapped || !all) {   // not seen before, or not all in the cache yet: deswizzled and hashed as before
+        mapped = 0; all = 1; fmt = -1;
+        par_for(ns, astc_find, &aj);
+        int complete = 1;
+        for (int i = 0; i < ns; i++) {
+            const surf_t *s = &sf[i];
+            if (!s->rows) { all = 0; complete = 0; continue; }
+            all &= s->have && (fmt < 0 || s->fmt == fmt);   // one format for the whole image
+            if (s->have && fmt < 0) fmt = s->fmt;
+        }
+        if (complete && ns) tm_put(fp, sf, ns);
     }
-    free(pitches);
-    free(sizes);
+    g_up_find_ns += runtime_now_ns() - tf;
+    if (mapped && !im->bc7 && !(all && ns && to_bc7(im, srgb, fmt) && (g_bc7_images++, 1))) {
+        par_for(ns, plain_deswizzle, &aj);   // it stays RGBA8 after all: the decode below needs the rows
+        mapped = 0;
+    }
     if (!im->bc7 && all && ns && to_bc7(im, srgb, fmt)) {
         g_bc7_images++;
         static int said;   // TOTK_BC7_LOG=1: every image made BC7 (development)
@@ -948,6 +1093,7 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             if (!ok_of[i]) {
                 uint64_t te = runtime_now_ns();
                 g_up_misses++;
+                if (mapped && nvn_deswizzle(d, s->level, s->layer, src, (uint8_t *)s->rows, pitches[i])) continue;   // its rows, for the encoder
                 VkBuffer rb;
                 VkDeviceSize ro;
                 uint8_t *rgba = vkb_ring_alloc((VkDeviceSize)s->lw * s->lh * 4 * s->ld, 16, &rb, &ro);
@@ -982,6 +1128,8 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             if (sf[i].rgba && !sf[i].have) vkb_bc7_queue(sf[i].k, sf[i].rgba, sf[i].lw, sf[i].lh, sf[i].ld, srgb);
     }
     free(sf);
+    free(pitches);
+    free(sizes);
 }
 uint64_t vkb_bc7_images(void) { return g_bc7_images; }
 
@@ -1005,7 +1153,12 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
         im->upload_stamp = nvn_dirty_now();
         return 0;
     }
-    if (!im->upload_stamp) {   // first upload: does a GPU-written texture use the same memory? (aliasing, development log)
+    /* first upload: does a GPU-written texture use the same memory? (aliasing, development log). [Windows port] Only with
+       TOTK_ALIAS_LOG=1: the walk over every texture took 100-350 ms at each texture's first upload once tens of thousands
+       existed (freezes in play, and every frame where the game makes a new texture, 2026-10-27). */
+    static int alias_log = -1;
+    if (alias_log < 0) alias_log = getenv("TOTK_ALIAS_LOG") != NULL;
+    if (!im->upload_stamp && alias_log) {
         static int said;
         vkb_lock(&g_mu, LK_IMAGES);
         for (entry *e = g_all; e && said < 32; e = e->all_next) {
@@ -1040,7 +1193,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     g_up_gather_ns += runtime_now_ns() - tg;
     int srgb = d->format >= 0x87 && d->format <= 0x94;
     if (im->astc && vkb_bc7_on() && bpb == 16) {
-        astc_upload(cb, im, src, bw, bh, srgb);
+        astc_upload(cb, im, src, L.size, bw, bh, srgb);
         free(gathered);
         __atomic_store_n(&im->uploading, 0, __ATOMIC_RELEASE);
         return 1;
@@ -1090,8 +1243,12 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
         for (uint32_t layer = 0; layer < im->layers; layer++) {
             VkBuffer buf;
             VkDeviceSize off;
-            uint8_t *rows = vkb_ring_alloc(bytes, 16, &buf, &off);
-            if (nvn_deswizzle(d, level, layer, src, rows, pitch)) continue;
+            /* [Windows port] D16: deswizzled into host memory and converted from there. The ring is write-combined device
+               memory (resizable BAR): the conversion's reads of it took ~350 ms for a 960x960x4 depth texture the game makes
+               anew in some scenes (2026-10-27). */
+            uint8_t *host16 = depth_up && bpb == 2 ? malloc((size_t)bytes) : NULL;
+            uint8_t *rows = host16 ? host16 : vkb_ring_alloc(bytes, 16, &buf, &off);
+            if (nvn_deswizzle(d, level, layer, src, rows, pitch)) { free(host16); continue; }
             VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = bx * (uint32_t)bw, .bufferImageHeight = by * (uint32_t)bh,
                                    .imageSubresource = {depth_up ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
                                    .imageExtent = {lw, lh, ld}};
@@ -1100,6 +1257,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
                 for (uint64_t k = 0; k < (uint64_t)lw * lh * ld; k++) { uint16_t v; memcpy(&v, rows + 2 * k, 2); f[k] = v / 65535.0f; }
                 r.bufferOffset = off;
             }
+            free(host16);
             if (im->astc) {   // decoded texels, slice by slice
                 uint8_t *rgba = vkb_ring_alloc((VkDeviceSize)lw * lh * 4 * ld, 16, &buf, &off);
                 for (uint32_t z = 0; z < ld; z++)
