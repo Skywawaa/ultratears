@@ -257,7 +257,7 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, uint64_t pc) {
         uint64_t value = 0;
         unsigned id = (unsigned)r[1];
         switch (id) {
-        case 0: value = 7; break;
+        case 0: value = runtime_core_mask(); break;   /* CoreMask: the virtual application cores (threads.c, TOTK_CORES; the Switch: 7) */
         case 1: value = 0x0ffffffff0000000ULL; break;
         case 2: value = ALIAS_START; break;
         case 3: value = ALIAS_SIZE; break;

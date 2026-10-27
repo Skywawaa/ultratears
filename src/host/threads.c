@@ -145,12 +145,80 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 // run guest code; a core is given up only where Horizon would switch threads (waits, sleep, yield, exit, blocking
 // host services) and handed to the best waiting thread (lowest priority value, then first come). A thread that a
 // higher-priority waiter wants to preempt gives its core up at its next SVC. TOTK_FREE_CORES=1 disables this.
-#define NCORE 3
-static thr_t *g_core_owner[NCORE];
+//
+// [experimental, all off by default]
+// TOTK_CORES=<n> (3..8): n virtual application cores instead of the Switch's 3. The game sees them through GetInfo
+// CoreMask (svc.c) and nn::os::GetThreadAvailableCoreMask: of its 16 callers in main, 15 discard the result (an
+// assert compiled out of sead::Thread::setAffinity; the masks it sets are the game's own constants for cores 0-2), the
+// one that uses it is Havok's hkHardwareInfo (main+0x11660c0: numThreads = popcount), so with n > 3 the physics
+// thread pool grows and its extra workers (default mask: all cores) run beside the game's three. Risk: 274 call sites
+// in main key data by nn::os::GetCurrentCoreNumber; where they index arrays sized for 3 cores a core number >= 3
+// corrupts memory. Test, do not ship blind.
+// TOTK_CORE_PREEMPT=1: the preemption point at SVC entry (runtime_core_checkpoint), which MacNativeGames calls and
+// this port never wired: a thread whose core a higher-priority thread waits for gives it up at its next SVC.
+// TOTK_CORE_LOG=1: a census of guest threads (name, priority, ideal core, mask) at their first SVC and at exit, every
+// SetThreadCoreMask, and every 5 s the busy share of each virtual core plus the time threads spent waiting for a
+// core: near-zero waits mean the game cannot use a fourth core, large waits mean it could.
+#define MAXCORE 8
+static int g_ncore = 3;
+static thr_t *g_core_owner[MAXCORE];
 static thr_t *g_core_wait;
-static int g_cores_on = -1;
-static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
+static int g_cores_on = -1, g_core_log, g_core_preempt;
+static uint64_t g_core_busy_ns[MAXCORE], g_core_wait_ns, g_core_waits, g_core_stat_t0;
+static void cores_init(void) {
+    if (g_cores_on >= 0) return;
+    const char *n = getenv("TOTK_CORES"); int k = n && *n ? atoi(n) : 3;
+    if (k < 3) k = 3;
+    if (k > MAXCORE) k = MAXCORE;
+    g_ncore = k;
+    const char *l = getenv("TOTK_CORE_LOG"); g_core_log = l && *l && strcmp(l, "0");
+    const char *p = getenv("TOTK_CORE_PREEMPT"); g_core_preempt = p && *p && strcmp(p, "0");
+    g_core_stat_t0 = now_ns();
+    if (k != 3 || g_core_log || g_core_preempt)
+        LOG("virtual cores: %d (TOTK_CORES); SVC preemption point %s (TOTK_CORE_PREEMPT); core census %s (TOTK_CORE_LOG)", k,
+            g_core_preempt ? "on" : "off", g_core_log ? "on" : "off");
+    g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1;
+}
+static int cores_enabled(void) { cores_init(); return g_cores_on; }
+static uint64_t core_all_mask(void) { cores_init(); return (1ull << g_ncore) - 1; }
+uint64_t runtime_core_mask(void) { return core_all_mask(); }   // svc.c: GetInfo(CoreMask), the game's view of its cores
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+// TOTK_CORE_LOG: the SDK's name of the calling thread. The thread's TLS block (+0x1f8) points at its nn::os::ThreadType,
+// whose kernel handle is at +0x1b0 and name pointer at +0x1a0 (nn::os::detail::ThreadManager::CreateThread, sdk+0x141ab8).
+static const char *thread_name_self(const thr_t *t, char *buf, size_t n) {
+    Cpu *c = guest_cpu(); buf[0] = 0;
+    if (!c || c->tpidrro < GUEST_LO || c->tpidrro >= GUEST_HI - 0x200) return buf;
+    uint64_t tt = *(uint64_t *)(uintptr_t)(c->tpidrro + 0x1f8);
+    if (tt < GUEST_LO || tt >= GUEST_HI - 0x200 || *(uint32_t *)(uintptr_t)(tt + 0x1b0) != t->handle) return buf;   // the host's placeholder block, or not an SDK thread
+    uint64_t np = *(uint64_t *)(uintptr_t)(tt + 0x1a0);
+    if (np < GUEST_LO || np >= GUEST_HI - 0x40) return buf;
+    snprintf(buf, n, "%.31s", (const char *)(uintptr_t)np);
+    return buf;
+}
+static void core_census(const thr_t *t, const char *what) {   // TOTK_CORE_LOG, on the thread itself
+    char name[40];
+    LOG("%s h=%#x '%s' prio %d ideal core %d mask %#llx on core %d after %llu ms, %llu svcs", what, t->handle, thread_name_self(t, name, sizeof name),
+        t->prio, t->core, (unsigned long long)t->mask, t->cur_core, (unsigned long long)((now_ns() - t->born_ns) / 1000000), (unsigned long long)t->nsvc);
+}
+static void core_stats_tick(void) {   // TOTK_CORE_LOG: every 5 s, from whichever thread's SVC comes first
+    uint64_t now = now_ns();
+    if (now - g_core_stat_t0 < 5000000000ull) return;
+    glock();
+    if (now - g_core_stat_t0 < 5000000000ull) { pthread_mutex_unlock(&G); return; }
+    uint64_t span = now - g_core_stat_t0, busy[MAXCORE], wns = g_core_wait_ns, wn = g_core_waits; int nwait = 0, nthr = 0;
+    for (int i = 0; i < g_ncore; i++) {
+        busy[i] = g_core_busy_ns[i]; g_core_busy_ns[i] = 0;
+        if (g_core_owner[i]) { busy[i] += now - g_core_owner[i]->core_since; g_core_owner[i]->core_since = now; }
+    }
+    for (thr_t *w = g_core_wait; w; w = w->cnext) nwait++;
+    for (thr_t *t = g_all; t; t = t->all) if (t->started && !t->exited) nthr++;
+    g_core_wait_ns = 0; g_core_waits = 0; g_core_stat_t0 = now;
+    pthread_mutex_unlock(&G);
+    char b[256]; size_t o = 0;
+    for (int i = 0; i < g_ncore && o < sizeof b - 16; i++) o += (size_t)snprintf(b + o, sizeof b - o, " c%d %.0f%%", i, 100.0 * (double)busy[i] / (double)span);
+    LOG("cores over %.1f s:%s; %llu core waits totalling %.1f ms (%.1f%% of one core); %d threads live, %d waiting for a core now",
+        span / 1e9, b, (unsigned long long)wn, wns / 1e6, 100.0 * (double)wns / (double)span, nthr, nwait);
+}
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
@@ -160,17 +228,21 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL;
+    if (g_core_log) g_core_busy_ns[c] += now_ns() - t->core_since;
+    core_grant(c);
 }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
-    if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
-    int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
-    for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
+    if (!(t->mask & core_all_mask())) die("thread %#x core mask %#llx has no application core (%d cores)", t->handle, (unsigned long long)t->mask, g_ncore);
+    int c = t->core >= 0 && t->core < g_ncore && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
+    for (int i = 0; c < 0 && i < g_ncore; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
+    uint64_t w0 = g_core_log ? now_ns() : 0;
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    for (int i = 0; i < g_ncore; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    if (g_core_log) { g_core_wait_ns += now_ns() - w0; g_core_waits++; }
 }
 static thr_t *me_or_null(void) { return t_self; }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
@@ -264,6 +336,7 @@ static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 
 static _Noreturn void thread_exit_on_host(void *argument) {
     thr_t *t=argument;
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
+    if (g_core_log) core_census(t, "exit");   // [port] safe here: guest code runs on the 8 MiB host stack, not the guest stack the note below means
     // 这里不打日志：退出发生在客体线程自己的栈上（有的只有十几 KiB），带浮点的 printf 会把栈撑爆（真机冒烟：LibcurlResolver 退出时 SIGBUS，回溯 fprintf → __dtoa）。时刻只记下来，现场导出时再打
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     glock();
@@ -283,7 +356,7 @@ static _Noreturn void thread_exit(thr_t *t) { thread_exit_on_host(t); }   // alr
 uint32_t svc_thread_main_init(void) {
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self();
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = core_all_mask(); t->pt = pthread_self();
     t->cur_core = -1;
     glock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
     t_self = t;
@@ -343,24 +416,28 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
 }
 
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = t_self; if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
+    { thr_t *me = t_self; if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++;
+        if (me->preempt && g_core_preempt) runtime_core_checkpoint();   // TOTK_CORE_PREEMPT: a higher-priority thread waits for this core
+        if (g_core_log) { if (me->nsvc == 1) core_census(me, "thread"); core_stats_tick(); } } }
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
-        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
+        uint64_t all = core_all_mask();
+        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>=g_ncore){regs[0]=R_BAD_STATE;return 1;}
         thr_t *t = calloc(1, sizeof *t);
         if(!t)die("thread allocation");
         t->cur_core = -1;
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+        // The SDK's 6-argument nn::os::CreateThread passes IdealCoreUseProcessValue (-2): then any application core
+        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : all;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         glock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
         pthread_attr_destroy(&a);
-        LOG("CreateThread h=%#x entry=%#llx sp=%#llx", t->handle,t->entry,t->stack_top);
+        LOG("CreateThread h=%#x entry=%#llx sp=%#llx prio=%d core=%d", t->handle,t->entry,t->stack_top,t->prio,t->core);
         regs[0] = 0; regs[1] = t->handle; return 1;
     }
     case 0x09: {  // StartThread(w0)
@@ -407,11 +484,16 @@ int svc_thread(int num, uint64_t *regs) {
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
         glock();thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
+        uint64_t m = regs[2] & core_all_mask(); int64_t r = t ? 0 : R_BAD_HANDLE;
+        if (t && regs[2] && !m) r = R_BAD_STATE;   // no application core in the mask (Horizon: InvalidCombination)
+        else if (t) { int c = (int)regs[1]; if (c >= 0 && c < g_ncore) t->core = c; else if (c == -1) t->core = 0; if (m) t->mask = m;
                  if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
-        regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
+        if (t && g_core_log) LOG("SetThreadCoreMask h=%#x ideal %d mask %#llx -> ideal core %d mask %#llx%s", t->handle, (int)regs[1], (unsigned long long)regs[2], t->core, (unsigned long long)t->mask, r ? " (refused)" : "");
+        regs[0] = (uint64_t)r;pthread_mutex_unlock(&G); return 1;
     }
-    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
+    // GetCurrentProcessorNumber: the virtual core held. Without one (TOTK_FREE_CORES) the ideal core, and 0 for a thread
+    // created with the process default (-2): the game indexes per-core arrays with this, -2 would reach outside them.
+    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core >= 0 ? t->core : 0); return 1; }
     case 0x25: { glock();thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)

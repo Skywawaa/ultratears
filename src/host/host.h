@@ -44,6 +44,7 @@ void host_services_register(void);  // services_*.c: IPC services the SDK opens
 void hle_bind_system_event(void *event, int autoclear);
 void hle_signal_system_event(void *event);
 uint32_t runtime_thread_current_handle(void);
+uint64_t runtime_core_mask(void);   // the application cores the game is shown (bit per virtual core; TOTK_CORES)
 
 // ---- loader (src/runtime/loader.c): module memory for QueryMemory / SetMemoryPermission
 int runtime_module_query(uint64_t address, uint64_t *base, uint64_t *size, unsigned *state, unsigned *permission,
