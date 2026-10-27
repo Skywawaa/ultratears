@@ -39,6 +39,7 @@ void plat_thread_boost(void);   // a thread the frame waits for (the replay thre
 
 // ---- process
 void plat_init(void);                                // first thing in main()
+void plat_cpu_placement(void);   // one logical processor per core on CPUs with SMT and 8+ cores (Windows)
 bool plat_exe_path(char *buf, size_t size);
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
 #if defined(_WIN32) || defined(__linux__)

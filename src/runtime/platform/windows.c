@@ -121,6 +121,32 @@ void plat_sleep_until_ns(uint64_t t) {
 // game's audio threads stay above it.
 void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 
+// One logical processor per physical core for the whole process (SavageWind PR #200, measured +4-10% on an 8-core SMT
+// CPU): the game's three core threads, the replay thread and the recording threads then never share a core's execution
+// units with another busy thread. With fewer cores than those busy threads they would queue instead, so by default only
+// with SMT and 8 or more physical cores. TOTK_ONE_PER_CORE=1: always, 0: never.
+void plat_cpu_placement(void) {
+    DWORD_PTR all, sys, one = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &all, &sys)) return;
+    int logical = __builtin_popcountll((unsigned long long)all), cores = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    char *buf = len ? malloc(len) : NULL;
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
+        for (DWORD o = 0; o < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
+            DWORD_PTR m = e->Processor.GroupMask[0].Group == 0 ? e->Processor.GroupMask[0].Mask & all : 0;
+            if (m) cores++, one |= m & -m;   // the core's first logical processor
+            o += e->Size;
+        }
+    free(buf);
+    const char *x = getenv("TOTK_ONE_PER_CORE");
+    int on = one && (x && *x ? atoi(x) != 0 : cores >= 8 && logical > cores);
+    fprintf(stderr, "[totk] %d cores, %d logical processors: %s (TOTK_ONE_PER_CORE)\n", cores, logical,
+            on ? "one logical processor per core" : "all logical processors");
+    if (on) SetProcessAffinityMask(GetCurrentProcess(), one);
+}
+
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);

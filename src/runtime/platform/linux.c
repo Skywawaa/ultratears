@@ -115,6 +115,8 @@ static void require_cpu(void) {
 static void require_cpu(void) {}
 #endif
 
+void plat_cpu_placement(void) {}   // (one logical processor per core: measured on Windows only)
+
 void plat_init(void) {
     log_to_file_without_terminal();
     require_cpu();

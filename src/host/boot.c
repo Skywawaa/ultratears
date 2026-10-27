@@ -90,6 +90,7 @@ int main(int argc, char **argv) {
     const char *exefs = argc == 2 ? argv[1] : default_exefs();
     plat_init();
     plat_crash_handler_install();
+    plat_cpu_placement();
     if (!g_window) {
 #ifdef _WIN32
         for (uint64_t a = GUEST_LO; a < GUEST_HI;) {   // what already occupies the window
