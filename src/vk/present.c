@@ -2,8 +2,9 @@
 // not link vulkan-1 and starts (without a picture) on a machine with no Vulkan driver.
 // The present thread waits for a frame from the game, acquires a swapchain image, fits the newest game frame into it
 // (the replayer's output image) and presents it. The game never waits on the display here; its pacing comes from the vsync events (front_win.c).
-// Mailbox when the surface offers it (the newest frame wins, no tearing), FIFO otherwise.
+// Mailbox when the surface offers it (the newest frame wins, no tearing), FIFO otherwise; TOTK_PRESENT_MODE chooses.
 #include "present.h"
+#include "reflex.h"
 #include "vk.h"
 
 #include <SDL3/SDL.h>
@@ -53,6 +54,7 @@ static int create_present_objects(void) {
 }
 
 static void destroy_swapchain(void) {
+    vkr_swapchain(VK_NULL_HANDLE);
     for (uint32_t i = 0; i < nimages; i++) vk.vkDestroySemaphore(vkc.device, render_done[i], NULL);
     if (swapchain) vk.vkDestroySwapchainKHR(vkc.device, swapchain, NULL);
     swapchain = VK_NULL_HANDLE;
@@ -85,22 +87,31 @@ static int create_swapchain(void) {
     VkPresentModeKHR modes[16];
     if (nm > 16) nm = 16;
     vk.vkGetPhysicalDeviceSurfacePresentModesKHR(vkc.gpu, vkc.surface, &nm, modes);
+    /* TOTK_PRESENT_MODE: mailbox (default: the newest frame at each refresh, no tearing, frames above the refresh rate
+       still lower latency), fifo (classic vsync: never above the refresh rate) or immediate (no vsync: tearing without
+       G-Sync / FreeSync; with them, the lowest latency when TOTK_FPS_LIMIT is a little under the refresh rate). A mode
+       the surface lacks falls back to mailbox, then FIFO (always there). */
+    const char *pm = getenv("TOTK_PRESENT_MODE");
+    VkPresentModeKHR want = pm && !strcmp(pm, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR :
+                            pm && !strcmp(pm, "fifo") ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR;
     mode = VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    for (uint32_t i = 0; i < nm; i++) if (modes[i] == want) mode = want;
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
-    VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = vkc.surface,
+    VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .pNext = vkr_swapchain_info(NULL), .surface = vkc.surface,
         .minImageCount = count, .imageFormat = format, .imageColorSpace = pick.colorSpace, .imageExtent = extent,
         .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = mode, .clipped = VK_TRUE};
     if (!vk_check(vk.vkCreateSwapchainKHR(vkc.device, &ci, NULL, &swapchain), "vkCreateSwapchainKHR")) return 0;
+    vkr_swapchain(swapchain);
     nimages = MAX_IMAGES;
     vk.vkGetSwapchainImagesKHR(vkc.device, swapchain, &nimages, images);
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < nimages; i++) vk.vkCreateSemaphore(vkc.device, &si, NULL, &render_done[i]);
     LOG("swapchain %ux%u, %u images, %s", extent.width, extent.height, nimages,
-        mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo");
+        mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     return 1;
 }
 
@@ -126,6 +137,7 @@ typedef struct {
     int state;                   // 0 free, 1 written (pending), 2 being shown
     uint64_t seq;                // when it was written (newest pending wins)
     VkSemaphore timeline; uint64_t value; int crop[4];
+    uint64_t frame;              // the game's frame number (Reflex markers and present id); 0 = unknown
 } out_t;
 static out_t g_out[OUTS];
 static uint64_t g_out_seq;       // under mu
@@ -179,10 +191,11 @@ fail:
     return -1;
 }
 
-void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4]) {
+void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4], uint64_t frame) {
+    vkr_marker(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV, frame);
     pthread_mutex_lock(&mu);
     out_t *o = &g_out[slot];
-    o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1;
+    o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1; o->frame = frame;
     if (crop) memcpy(o->crop, crop, sizeof o->crop); else memset(o->crop, 0, sizeof o->crop);
     for (int i = 0; i < OUTS; i++)   // older pending frames are never shown
         if (i != slot && g_out[i].state == 1 && g_out[i].seq < o->seq) g_out[i].state = 0;
@@ -241,13 +254,18 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = out ? 2u : 1u, .pWaitSemaphoreInfos = waits,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
-    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+    // Reflex: the present carries the game frame's id (ids only grow: older pending frames are never shown)
+    uint64_t frame = out && vkr_on() ? out->frame : 0;
+    VkPresentIdKHR pid = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &frame};
+    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = frame ? &pid : NULL, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &render_done[idx], .swapchainCount = 1, .pSwapchains = &swapchain,
                            .pImageIndices = &idx};
+    vkr_marker(VK_LATENCY_MARKER_PRESENT_START_NV, frame);
     vk_queue_lock();   // the replayer submits on the same queue
     VkResult s = vk.vkQueueSubmit2(vkc.queue, 1, &si, in_flight[slot]);
     r = s == VK_SUCCESS ? vk.vkQueuePresentKHR(vkc.queue, &pi) : s;
     vk_queue_unlock();
+    vkr_marker(VK_LATENCY_MARKER_PRESENT_END_NV, frame);
     if (!vk_check(s, "vkQueueSubmit2")) return 0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&resized, 1);
     else if (r != VK_SUCCESS) { vk_check(r, "vkQueuePresentKHR"); return 0; }

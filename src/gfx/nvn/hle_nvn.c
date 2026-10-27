@@ -2293,6 +2293,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    /* [Windows port] NVIDIA Reflex (src/vk/reflex.c): after the frame limiter, the driver may hold the frame's start a
+       little longer so the GPU queue stays short; once per game frame (a frame can acquire more than once). */
+    { extern void vkr_sleep(uint64_t frame); static uint64_t slept;
+      if (!dm_detclock_enabled() && slept != g_frame + 1) { slept = g_frame + 1; vkr_sleep(slept); } }
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
@@ -2673,6 +2677,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    { extern void vkr_sim_end(uint64_t frame); vkr_sim_end(g_frame + 1); }   // Reflex: this frame's id, as the present job's
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();

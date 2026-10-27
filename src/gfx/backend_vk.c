@@ -1297,6 +1297,11 @@ static void dump_check(uint64_t n) {
     }
 }
 
+// The replay frame number (hle_nvn.c sets it after each present, on the thread that replays): the frame being presented
+// is the next one, the id its Reflex markers and window present carry.
+static uint64_t g_replay_frame;
+void mtl_set_frame(uint64_t f) { g_replay_frame = f; }
+
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_ticket, 1) + 1;
@@ -1418,7 +1423,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     VkBuffer shot = shot_record(cb, n, out, im->width, im->height);
     uint64_t fence = mtl_sub_commit();
     if (shot) shot_write(fence, im->width, im->height);
-    vkp_out_ready(slot, g_timeline, fence, crop);
+    vkp_out_ready(slot, g_timeline, fence, crop, g_replay_frame + 1);
     return n;
 }
 

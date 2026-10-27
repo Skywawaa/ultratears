@@ -381,6 +381,17 @@ def step_finish(dump, state, cpus):
     if fonts.is_dir() and list(fonts.glob('*.bfttf')):
         shutil.copytree(fonts, DATA / 'fonts', dirs_exist_ok=True)
     lines.append('fonts=data/fonts')
+    lines += ['', '# Frame rate and latency: remove the # in front of a setting to change its default.',
+              '# Frame rate limit: display (the monitor\'s refresh rate), a number such as 144, or unlimited',
+              '#TOTK_FPS_LIMIT=display',
+              '# Presentation: mailbox, fifo (vsync) or immediate (for G-Sync / FreeSync; tears without them)',
+              '#TOTK_PRESENT_MODE=mailbox',
+              '# NVIDIA Reflex: 0 off, 1 on, 2 on with boost',
+              '#TOTK_REFLEX=1',
+              '# 0: the game\'s original 30 fps',
+              '#TOTK_FPS60=1',
+              '# The monitor\'s refresh rate, only if it reports a wrong one',
+              '#TOTK_DISPLAY_HZ=144']
     (ROOT / 'ultratears.cfg').write_text('\n'.join(lines) + '\n')
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():

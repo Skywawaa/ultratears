@@ -43,7 +43,8 @@
     X(vkCreateQueryPool) X(vkResetQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) \
     X(vkCmdSetAttachmentFeedbackLoopEnableEXT) X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) \
     X(vkGetDescriptorSetLayoutSizeEXT) X(vkGetDescriptorSetLayoutBindingOffsetEXT) X(vkGetDescriptorEXT) \
-    X(vkCmdBindDescriptorBuffersEXT) X(vkCmdSetDescriptorBufferOffsetsEXT)
+    X(vkCmdBindDescriptorBuffersEXT) X(vkCmdSetDescriptorBufferOffsetsEXT) \
+    X(vkSetLatencySleepModeNV) X(vkLatencySleepNV) X(vkSetLatencyMarkerNV)
 #define VK_FN_DECLARE(f) PFN_##f f;
 typedef struct { VK_FN_GLOBAL(VK_FN_DECLARE) VK_FN_INSTANCE(VK_FN_DECLARE) VK_FN_DEVICE(VK_FN_DECLARE) } VkFunctions;
 #undef VK_FN_DECLARE
@@ -64,6 +65,7 @@ typedef struct {
     int has_local_read;      // VK_KHR_dynamic_rendering_local_read: barriers inside a pass (draws reading what earlier draws wrote)
     VkPhysicalDeviceDescriptorBufferPropertiesEXT db;   // VK_EXT_descriptor_buffer: descriptor sizes, alignment, ranges
     int has_checkpoints;     // TOTK_VK_CHECKPOINTS=1: VK_NV_device_diagnostic_checkpoints (where a lost device stopped)
+    int has_low_latency;     // VK_NV_low_latency2 + VK_KHR_present_id: NVIDIA Reflex (reflex.c)
 } VkContext;
 extern VkContext vkc;
 

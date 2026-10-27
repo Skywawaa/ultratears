@@ -149,6 +149,8 @@ static VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT ffld = {VK_
 static int has_fl, has_fld;
 static VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
 static int has_lr;
+static VkPhysicalDevicePresentIdFeaturesKHR fpid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
+static int has_pid, has_ll2;
 
 static int create_device(void) {
     ExtList ex = device_extensions(vkc.gpu);
@@ -184,9 +186,14 @@ static int create_device(void) {
         {VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, &flr, &has_lr},
         // development (TOTK_VK_CHECKPOINTS=1): the markers a lost device reached
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
+        // NVIDIA Reflex (reflex.c): low-latency sleep and markers, matched to presents by their ids
+        {VK_KHR_PRESENT_ID_EXTENSION_NAME, &fpid, &has_pid},
+        {VK_NV_LOW_LATENCY_2_EXTENSION_NAME, NULL, &has_ll2},
     };
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
+        if ((want[i].flag == &has_pid || want[i].flag == &has_ll2) && (!vkc.surface || (getenv("TOTK_REFLEX") && !atoi(getenv("TOTK_REFLEX"))))) continue;
+        if (want[i].flag == &has_ll2 && !ext_in(&ex, VK_KHR_PRESENT_ID_EXTENSION_NAME)) continue;
         if (want[i].flag == &vkc.has_checkpoints && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
@@ -203,6 +210,7 @@ static int create_device(void) {
     vkc.has_feedback_loop = has_fl && has_fld && ffl.attachmentFeedbackLoopLayout && ffld.attachmentFeedbackLoopDynamicState;
     if (!vkc.has_feedback_loop) LOG("no attachment feedback loops: textures that are attachments of their pass read empty");
     vkc.has_local_read = has_lr && flr.dynamicRenderingLocalRead;
+    vkc.has_low_latency = has_pid && has_ll2 && fpid.presentId;
     if (vkc.has_feedback_loop && !vkc.has_local_read) LOG("no barriers inside a pass: a draw sampling its own target may miss earlier draws' writes");
     // TOTK_VK_ROBUST=1 (development): bounds-checked buffer access, to tell a shader's out-of-range access from other
     // causes of a lost device

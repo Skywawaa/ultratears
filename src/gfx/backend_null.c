@@ -22,7 +22,6 @@ void mtl_present_wait(uint64_t ticket) { (void)ticket; }
 void mtl_shot_at_present(const tex_t *t) { (void)t; }
 int mtl_has_window(void) { return 0; }
 double mtl_presented_time(uint64_t n) { (void)n; return 0; }
-void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_note_world(void) {}
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 uint32_t mtl_present_qos(void) { return 0; }

@@ -18,6 +18,7 @@ int vkp_active(void);               // a window with a swapchain is there (else 
 
 // Output images (replay thread): acquire one of width x height (B8G8R8A8_UNORM, created / resized here), record the
 // copy of the game's frame into it (layout UNDEFINED -> TRANSFER_DST -> TRANSFER_SRC), then hand it over with the
-// timeline value after which the copy is done. -1 = none free (the frame is dropped).
+// timeline value after which the copy is done, and the game's frame number (Reflex; 0 = unknown). -1 = none free (the
+// frame is dropped).
 int vkp_out_acquire(uint32_t width, uint32_t height, VkImage *image);
-void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4]);
+void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4], uint64_t frame);
