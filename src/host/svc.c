@@ -31,7 +31,19 @@
 #define ASLR_START    LOW_START
 #define ASLR_SIZE     ((1ULL << 39) - LOW_START)
 #define SYSTEM_RESOURCE_BUDGET (32ULL << 20)
-#define APP_POOL      0xcd500000ULL  /* retail application pool, 3.2 GiB (MacNativeGames' default without 2K heaps) */
+/* The retail application pool, 3.2 GiB, plus what bigger texture heaps take (game_res.c: TOTK_OUTPUT_RES,
+   TOTK_RENDER_RES), rounded up to 2 MiB, so no other heap shrinks (MacNativeGames services.c app_pool). */
+uint64_t runtime_heap_extra_bytes(void);
+static uint64_t app_pool(void) {
+    static uint64_t v;
+    if (!v) {
+        uint64_t extra = (runtime_heap_extra_bytes() + 0x1fffff) & ~0x1fffffULL;
+        v = 0xcd500000ULL + extra;
+        if (extra) fprintf(stderr, "[totk] application pool %#llx: +%llu MiB for the bigger texture heaps\n", (unsigned long long)v, (unsigned long long)(extra >> 20));
+    }
+    return v;
+}
+#define APP_POOL      app_pool()
 
 static uint64_t heap_size;
 static unsigned char alias_pages[ALIAS_SIZE / 4096];

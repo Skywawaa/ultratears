@@ -109,6 +109,16 @@ int mtl_display_hz(void) {
     const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
     return m && m->refresh_rate > 0 ? (int)(m->refresh_rate + 0.5f) : 60;
 }
+// The display's size in pixels (TOTK_RENDER_RES / TOTK_OUTPUT_RES=display, game_res.c); 0 if SDL has no display yet.
+int mtl_display_size(unsigned *w, unsigned *h) {
+    SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
+    if (!d) d = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+    if (!m || m->w <= 0 || m->h <= 0) return 0;
+    *w = (unsigned)(m->w * (m->pixel_density > 0 ? m->pixel_density : 1) + 0.5f);
+    *h = (unsigned)(m->h * (m->pixel_density > 0 ? m->pixel_density : 1) + 0.5f);
+    return 1;
+}
 
 // Motion: the controller's accelerometer and gyro (SDL_EVENT_GAMEPAD_SENSOR_UPDATE) go to motion_fusion.c.
 static void pad_attached(void) {   // pad_lock held; pad may be NULL

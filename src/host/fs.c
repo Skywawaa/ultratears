@@ -215,6 +215,28 @@ static int romfs_owns(const char *path) {
     return n && path && !strncmp(path, mount_name, n) && path[n] == ':';
 }
 static int romfs_handle(uint64_t h) { return h > ROM_BASE && h < ROM_BASE + NROM; }
+/* [Windows port] One file served from memory instead of the RomFS: the heap table with bigger texture heaps for a bigger
+   canvas or scene (game_res.c). Made at its first open from the RomFS's own file. */
+#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
+uint8_t *totk_heapdef_patch(const uint8_t *zs, size_t n, size_t *out_n);
+static uint64_t mem_index = UINT64_MAX;
+static uint8_t *mem_data;
+static uint64_t mem_size;
+static void mem_file_init(uint64_t i, const char *p) {
+    static int done;
+    if (done) return;
+    done = 1;
+    Entry e = entry(i);
+    uint8_t *raw = malloc(e.size ? e.size : 1);
+    int fd = -1;
+    if (rom_folder) { char full[8192]; snprintf(full, sizeof full, "%s/%s", rom_dir, p); fd = open(full, O_RDONLY | O_BINARY); }
+    ssize_t r = raw ? pread(rom_folder ? fd : image_fd, raw, (size_t)e.size, rom_folder ? 0 : (off_t)e.offset) : -1;
+    if (fd >= 0) close(fd);
+    size_t n = 0;
+    uint8_t *patched = r == (ssize_t)e.size ? totk_heapdef_patch(raw, (size_t)e.size, &n) : NULL;
+    free(raw);
+    if (patched) { mem_data = patched; mem_size = n; mem_index = i; }
+}
 static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     runtime_fs_log("rom", path ? path : "(null)");
     if (!out || mode != OPEN_READ) return R_ROM_UNSUPPORTED;
@@ -222,6 +244,7 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!p) return R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
+    if (!strcmp(p, HEAPDEF)) { pthread_mutex_lock(&rom_lock); mem_file_init(i, p); pthread_mutex_unlock(&rom_lock); }
     int fd = -1;
     if (rom_folder) {
         char full[8192];
@@ -239,9 +262,11 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
     Entry e = entry(i - 1);
+    if (i - 1 == mem_index) e.size = mem_size;
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
+    if (i - 1 == mem_index) { memcpy(buffer, mem_data + offset, (size_t)n); *out = n; return 0; }
     while (done < n) {
         ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
         need(r > 0, "RomFS image read");
@@ -253,7 +278,7 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    *out = (int64_t)entry(i - 1).size;
+    *out = (int64_t)(i - 1 == mem_index ? mem_size : entry(i - 1).size);
     return 0;
 }
 static void romfs_close(uint64_t h) {

@@ -106,7 +106,45 @@ FPS60 = {0x8002db204: fps60(0x6b08015f, 0x7100055f), 0x8002db208: fps60(0x1a89b1
          0x8002db36c: fps60(0x1a88c1ac, 0x1a9fc5ac), 0x8002db340: fps60(0xb9400288, 0x52800028),
          0x8002db34c: fps60(0x2a0a03f5, 0x1a9fa555)}
 
+# ---- Resolution (1.4.3), from the same file: src/host/game_res.c holds the sizes (totk_res_page) and grows the heaps.
+RES = '{ extern uint64_t totk_res_page[]; c->x[%d] = (uint64_t)(uintptr_t)totk_res_page; }'
+
+
+def render_res(original, words, page=False):
+    """The scene size (renderer +0xcc4 width, +0xcc8 height) comes from totk_res_page+16 instead of the graphics
+    parameters' entry (docked 1600x900). Every path converges at main+0x585e48: scvtf s0, w11 -> x3 = page;
+    str s0, [x19, #0xcc4] -> ldp s0, s1, [x3, #16]; scvtf s0, w10 -> str s0, [x19, #0xcc4];
+    str s0, [x19, #0xcc8] -> str s1, [x19, #0xcc8]. x3 is scratch here; w9 still holds the output size."""
+    def patch(gen, addr):
+        expect(gen, addr, original, 'render resolution')
+        body = (RES % 3 if page else '') + ' '.join(lifted(gen, addr, w) for w in words)
+        return switched(gen, addr, 'totk_render_res_on', body, original)
+    return patch
+
+
+def output_size(original, code):
+    """The game's canvas (display 0's size, 1920x1080): the size the display configuration starts with
+    (mov x8, #1920; movk x8, #1080, lsl #32) and, where the configuration publishes its active output
+    (main+0x3dcb28, lsr x4, x3, #32 before str x3, [x19, #0x508]), the canvas at +0x10 and the output in x3."""
+    def patch(gen, addr):
+        expect(gen, addr, original, 'output resolution')
+        return switched(gen, addr, 'totk_output_res_on', code, original)
+    return patch
+
+
+RESOLUTION = {
+    0x800585e48: render_res(0x1e220160, [], page=True),
+    0x800585e50: render_res(0xbd0cc660, [0x2d420460]),
+    0x800585e54: render_res(0x1e220140, [0xbd0cc660]),
+    0x800585e60: render_res(0xbd0cca60, [0xbd0cca61]),
+    0x800bdb578: output_size(0xd280f008, '{ extern uint64_t totk_output_w(void); c->x[8] = totk_output_w(); }'),
+    0x800bdb584: output_size(0xf2c08708, '{ extern uint64_t totk_output_h(void); '
+                                         'c->x[8] = (c->x[8] & ~(0xffffull << 32)) | totk_output_h() << 32; }'),
+    0x8003dcb28: output_size(0xd360fc64, '{ extern uint64_t totk_res_page[]; c->x[3] = totk_res_page[4]; '
+                                         'ST64(c->x[19] + 0x10, c->x[3]); c->x[4] = c->x[3] >> 32; }'),
+}
+
 PATCHES = {
     0x8005843e0: drs_off,
-    **FPS60, **REALTIME, **CLOTH, **BOUNCE,
+    **FPS60, **REALTIME, **CLOTH, **BOUNCE, **RESOLUTION,
 }

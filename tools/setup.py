@@ -391,7 +391,11 @@ def step_finish(dump, state, cpus):
               '# 0: the game\'s original 30 fps',
               '#TOTK_FPS60=1',
               '# The monitor\'s refresh rate, only if it reports a wrong one',
-              '#TOTK_DISPLAY_HZ=144']
+              '#TOTK_DISPLAY_HZ=144',
+              '# Resolution: the 3D scene (the game: 1600x900) and the canvas with the HUD and menus (the game: 1920x1080),',
+              '# each <width>x<height> or display. Above the game\'s sizes the texture heaps grow (about 1.5 GB more at 4K).',
+              '#TOTK_RENDER_RES=display',
+              '#TOTK_OUTPUT_RES=display']
     (ROOT / 'ultratears.cfg').write_text('\n'.join(lines) + '\n')
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():
