@@ -369,6 +369,95 @@ static int bin_have(const char *key) {
 }
 
 // key: the shader's key, for the binaries kept between runs (NULL: a variant, always compiled)
+/* [Windows port] The translator writes a gather with four offsets (Maxwell TLD4 with per-texel offsets: GLSL
+   textureGatherOffsets) as OpImageGather / OpImageDrefGather with ConstOffsets whose offsets are module-level
+   OpConstantComposites of the registers' OpLoads (ids defined later, inside the function): invalid SPIR-V, on which
+   NVIDIA's compiler crashes (shaders b940aa86..., dfe7662f..., 2026-10-27). Rewritten as drivers do for
+   textureGatherOffsets: those "constants" are dropped, and each such gather becomes four gathers with one Offset each
+   (ImageGatherExtended), offset k built where the gather is (OpCompositeConstruct of the same values), texel k from
+   gather k. A composite constant inside a function becomes OpCompositeConstruct. *spvp may be replaced (malloc'd);
+   returns the new word count. */
+static size_t fix_gather_offsets(uint32_t **spvp, size_t n) {
+    uint32_t *w = *spvp, bound = w[3];
+    size_t first_fn = 0, fixes = 0, dropped = 0;
+    int has_ext = 0;
+    uint32_t *vec_of = calloc(bound, sizeof *vec_of), *def_at = calloc(bound, sizeof *def_at);
+    uint8_t *is_const = calloc(bound, 1), *bad = calloc(bound, 1);   // module constants; module "constants" of non-constants
+    if (!vec_of || !def_at || !is_const || !bad) die("SPIR-V rewrite");
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) break;
+        if (op == 17 && w[i + 1] == 25) has_ext = 1;   // OpCapability ImageGatherExtended
+        if (op == 54 && !first_fn) first_fn = i;       // OpFunction
+        if (op == 23 && w[i + 1] < bound) vec_of[w[i + 1]] = w[i + 2];   // OpTypeVector: component type
+        if (!first_fn && (op == 41 || op == 42 || op == 43 || op == 44 || op == 46) && wc >= 3 && w[i + 2] < bound) {
+            is_const[w[i + 2]] = 1;
+            def_at[w[i + 2]] = (uint32_t)i;
+        }
+        i += wc;
+    }
+    for (int changed = 1; changed;) {   // a composite of anything but constants is not a constant (transitively)
+        changed = 0;
+        for (uint32_t id = 0; id < bound; id++) {
+            if (!is_const[id] || bad[id] || (w[def_at[id]] & 0xffff) != 44) continue;
+            uint32_t at = def_at[id], wc = w[at] >> 16;
+            for (uint32_t k = 3; k < wc; k++)
+                if (w[at + k] >= bound || !is_const[w[at + k]] || bad[w[at + k]]) { bad[id] = 1; changed = 1; break; }
+        }
+    }
+    for (uint32_t id = 0; id < bound; id++) dropped += bad[id];
+    size_t cap = n + 2 + 4096, o = 0;
+    uint32_t *r = malloc(cap * 4);
+    if (!r) die("SPIR-V rewrite");
+    memcpy(r, w, 5 * 4);
+    o = 5;
+    if (dropped && !has_ext) { r[o++] = (2u << 16) | 17; r[o++] = 25; }
+    size_t changed = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) break;
+        if (o + 128 > cap) { cap *= 2; if (!(r = realloc(r, cap * 4))) die("SPIR-V rewrite"); }
+        if (op == 44 && (!first_fn || i < first_fn) && w[i + 2] < bound && bad[w[i + 2]]) { i += wc; changed++; continue; }
+        if (op == 44 && first_fn && i > first_fn) {   // a "constant" inside a function: a composite of what it holds
+            memcpy(r + o, w + i, wc * 4);
+            r[o] = (wc << 16) | 80;
+            o += wc; i += wc; changed++;
+            continue;
+        }
+        uint32_t offs = (op == 96 || op == 97) && wc == 8 && w[i + 6] == 0x20 ? w[i + 7] : 0;
+        if (offs && offs < bound && bad[offs] && (w[def_at[offs]] >> 16) == 7 && w[i + 1] < bound && vec_of[w[i + 1]]) {
+            uint32_t ty = w[i + 1], res = w[i + 2], si = w[i + 3], coord = w[i + 4], comp = w[i + 5], sc = vec_of[ty], x[4];
+            for (uint32_t k = 0; k < 4; k++) {
+                uint32_t in = w[def_at[offs] + 3 + k], e = in, g = bound++;
+                if (in < bound && bad[in] && (w[def_at[in]] >> 16) == 5) {   // offset k: the ivec2 of its two values, here
+                    e = bound++;
+                    r[o++] = (5u << 16) | 80; r[o++] = w[def_at[in] + 1]; r[o++] = e; r[o++] = w[def_at[in] + 3]; r[o++] = w[def_at[in] + 4];
+                }
+                x[k] = bound++;
+                r[o++] = (8u << 16) | op; r[o++] = ty; r[o++] = g; r[o++] = si; r[o++] = coord; r[o++] = comp;   // gather with it
+                r[o++] = 0x10; r[o++] = e;
+                r[o++] = (5u << 16) | 81; r[o++] = sc; r[o++] = x[k]; r[o++] = g; r[o++] = k;                 // its texel k
+            }
+            r[o++] = (7u << 16) | 80; r[o++] = ty; r[o++] = res;
+            for (int k = 0; k < 4; k++) r[o++] = x[k];
+            i += wc; changed++; fixes++;
+            continue;
+        }
+        memcpy(r + o, w + i, wc * 4);
+        o += wc; i += wc;
+    }
+    if (changed) {
+        r[3] = bound;
+        free(*spvp);
+        *spvp = r;
+        n = o;
+        static int said;
+        if (said++ < 16) VLOG("shader: %zu four-offset gather(s) rewritten, %zu invalid constant(s) dropped", fixes, dropped);
+    } else free(r);
+    free(vec_of); free(def_at); free(is_const); free(bad);
+    return n;
+}
+
 static VkResult create_object(const char *key, VkShaderStageFlagBits stage, const uint32_t *spv, size_t bytes, VkShaderEXT *obj) {
     pthread_once(&g_bin_once, bin_open);
     VkDescriptorSetLayout layout = vkb_set_layout(stage == VK_SHADER_STAGE_COMPUTE_BIT);
@@ -507,6 +596,7 @@ static int load(vkb_shader *s, const char *key, int nvn_stage) {
     free(j);
     // rewrite Binding decorations (OpDecorate %id Binding n: opcode 71, decoration 33)
     size_t nw = drop_cull_distance(spv, nspv / 4);
+    nw = fix_gather_offsets(&spv, nw);
     nspv = nw * 4;
     for (size_t i = 5; i < nw;) {
         uint32_t op = spv[i] & 0xffff, wc = spv[i] >> 16;
