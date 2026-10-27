@@ -724,6 +724,8 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im);
 // Several threads recording: into the submission's prologue, which runs before every chunk (the CPU wrote the bytes
 // before the submission, so earlier is as good; a GPU write to the image in a chunk still comes after it).
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;   // one upload at a time: the ASTC batch is shared
+static uint64_t g_up_find_ns, g_up_read_ns, g_up_enc_ns, g_up_gather_ns;   // the current upload's phases (slow upload log)
+static int g_up_misses;
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     uint64_t stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     if (vkb_mt_recording() && __atomic_load_n(&im->uploading, __ATOMIC_ACQUIRE)) {   // another thread is uploading it: its
@@ -732,16 +734,28 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     }
     if (!im->storage || im->gpu_written || (stamp && !vkb_tex_stale(im))) return 0;   // the common case: nothing to do
-    uint64_t t0 = runtime_now_ns();
+    uint64_t t0 = runtime_now_ns(), t_locked = t0;
     int r;
     if (vkb_mt_recording()) {
         pthread_mutex_lock(&g_up_mu);
+        t_locked = runtime_now_ns();
+        g_up_find_ns = g_up_read_ns = g_up_enc_ns = g_up_gather_ns = 0; g_up_misses = 0;
         vkb_pro_begin();
         r = tex_upload(vkb_cmd(), im);   // checks again: another thread may have uploaded it meanwhile
         vkb_pro_end();
         pthread_mutex_unlock(&g_up_mu);
-    } else r = tex_upload(cb, im);
+    } else { g_up_find_ns = g_up_read_ns = g_up_enc_ns = g_up_gather_ns = 0; g_up_misses = 0; r = tex_upload(cb, im); }
     vkb_step_add(PK_UPLOAD, t0);
+    uint64_t t1 = runtime_now_ns();
+    if (t1 - t0 > 30000000ull) {   // [Windows port] a slow upload (a freeze in play): where its time went
+        static int said;
+        if (said++ < 200)
+            VLOG("slow upload: texture %llu format %#x %ux%ux%u levels %u layers %u%s%s: %.0f ms (waited %.0f ms for another upload; "
+                 "gather %.0f, deswizzle+hash+lookup %.0f, cache reads %.0f, encoded now %.0f ms for %d surfaces)",
+                 (unsigned long long)im->serial, im->d.format, im->width, im->height, im->depth, im->levels, im->layers,
+                 im->astc ? " ASTC" : "", im->bc7 ? " as BC" : "", (t1 - t0) / 1e6, (t_locked - t0) / 1e6, g_up_gather_ns / 1e6,
+                 g_up_find_ns / 1e6, g_up_read_ns / 1e6, g_up_enc_ns / 1e6, g_up_misses);
+    }
     return r;
 }
 // ---- ASTC as BC7 (vkb_bc7.c). At its first upload an ASTC texture becomes a BC7 image when the cache holds every one of
@@ -880,7 +894,9 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
         }
     }
     astc_job aj = {sf, d, src, bw, bh, srgb, pitches, sizes};
+    uint64_t tf = runtime_now_ns();
     par_for(ns, astc_find, &aj);
+    g_up_find_ns += runtime_now_ns() - tf;
     for (int i = 0; i < ns; i++) {
         const surf_t *s = &sf[i];
         if (!s->rows) { all = 0; continue; }
@@ -920,7 +936,9 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             blocks_of[i] = vkb_ring_alloc(n_of[i], 16, &buf_of[i], &off_of[i]);
         }
         read_job rj = {sf, blocks_of, n_of, ok_of};
+        uint64_t tr = runtime_now_ns();
         par_for(ns, bc_read_one, &rj);
+        g_up_read_ns += runtime_now_ns() - tr;
         for (int i = 0; i < ns; i++) {
             surf_t *s = &sf[i];
             if (!s->rows) continue;
@@ -928,6 +946,8 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
             VkDeviceSize off = off_of[i];
             uint8_t *blocks = blocks_of[i];
             if (!ok_of[i]) {
+                uint64_t te = runtime_now_ns();
+                g_up_misses++;
                 VkBuffer rb;
                 VkDeviceSize ro;
                 uint8_t *rgba = vkb_ring_alloc((VkDeviceSize)s->lw * s->lh * 4 * s->ld, 16, &rb, &ro);
@@ -935,6 +955,7 @@ static void astc_upload(VkCommandBuffer cb, vkb_image *im, const uint8_t *src, i
                     astc_add(s->rows + s->slice * z, s->lw, s->lh, (uint32_t)bw, (uint32_t)bh, srgb, rgba + (VkDeviceSize)s->lw * s->lh * 4 * z);
                 astc_run();
                 vkb_bc7_encode_now(s->k, rgba, s->lw, s->lh, s->ld, srgb, bcf, blocks);
+                g_up_enc_ns += runtime_now_ns() - te;
             }
             VkBufferImageCopy r = {.bufferOffset = off, .bufferRowLength = (s->lw + 3) / 4 * 4, .bufferImageHeight = (s->lh + 3) / 4 * 4,
                                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s->level, s->layer, 1}, .imageExtent = {s->lw, s->lh, s->ld}};
@@ -1008,6 +1029,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     const uint8_t *src = im->storage;
     uint8_t *gathered = NULL;
     uint64_t gen = totk_vpool_generation();
+    uint64_t tg = runtime_now_ns();
     if (totk_vpool_gather((uintptr_t)im->storage, 0, NULL)) {   // (length 0: only whether it is in a virtual pool)
         gathered = malloc(L.size ? L.size : 1);
         if (!gathered) die("texture gather");
@@ -1015,6 +1037,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
         src = gathered;
         im->vpool_gen = gen;
     }
+    g_up_gather_ns += runtime_now_ns() - tg;
     int srgb = d->format >= 0x87 && d->format <= 0x94;
     if (im->astc && vkb_bc7_on() && bpb == 16) {
         astc_upload(cb, im, src, bw, bh, srgb);
@@ -1042,7 +1065,9 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
             }
         }
         astc_job dj = {sf, d, src, bw, bh, srgb, pitches, sizes};
+        uint64_t tf = runtime_now_ns();
         par_for(ns, plain_deswizzle, &dj);
+        g_up_find_ns += runtime_now_ns() - tf;
         for (int i = 0; i < ns; i++) {
             const surf_t *s = &sf[i];
             if (!s->rows) continue;

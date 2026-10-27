@@ -117,6 +117,11 @@ class Module:
         r = self._jump_table_fallthrough(br_pc, entry, end)
         if r is None:
             r = self._jump_table_taken(br_pc, entry, end)
+        if r is not None and len(set(r)) > 1:
+            more = self._other_table_bases(br_pc, entry, end)
+            if more - set(r):
+                self.stats['jumptables_several_bases'] += 1
+                return sorted(set(r) | more)
         # [TOTK] The emulation sets the register the bounds check compares; when the load indexes the table with
         # another register holding the same value (main 0x80209aa08: `cmp w22, #0xb` ... `ldrh w10, [x8, x28, lsl #1]`)
         # every index gives the same target (a table read at a fixed scratch address). Such a single-target result is
@@ -308,6 +313,63 @@ class Module:
         except uc.UcError:
             return None
         return sorted(set(targets))
+
+    def _other_table_bases(self, br_pc, entry, end):
+        """[Windows port] One `br` whose table base register is set to different tables on different paths (main
+        0x8015b9400: `ldrh w23, [x20, x18, lsl #1]` with x20 = 0x802cfe74a or 0x802cfe6d2 depending on the branch taken
+        earlier): the emulation replays the function's address materialization in order and so resolves one table only,
+        and a case of another ("no function at 8015b9fb0") stopped the game. The entries of every table the base register
+        is set to in the function are read here (target = adr base + entry << shift), each table until an entry leaves the
+        function; extra labels from data after a table are harmless. Returns the targets, or an empty set."""
+        rn = bits(self.word(br_pc), 5, 5)
+        load = add = adr_t = None
+        a = br_pc - 4
+        while a >= entry and br_pc - a <= 4 * 16 and self.lift(a).kind in ('op', 'asm'):
+            w = self.word(a)
+            if (w & 0x7F200000) == 0x0B000000 and (w & 31) == rn and add is None:   # add xD, xA, xI, lsl #s
+                add = a
+            elif (w & 0x9F000000) == 0x10000000 and adr_t is None:   # ADR: the targets' base
+                imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
+                adr_t = (a, a + (imm - (1 << 21) if imm & (1 << 20) else imm), w & 31)
+            elif (w & 0x3F200C00) == 0x38200800 and load is None:   # LDR{B,H,SB,SH,,SW} (register offset)
+                load = w
+            a -= 4
+        if load is None or add is None or adr_t is None:
+            return set()
+        aw = self.word(add)
+        if adr_t[2] not in (bits(aw, 5, 5), bits(aw, 16, 5)):
+            return set()
+        shift, size, signed = bits(aw, 10, 6), 1 << bits(load, 30, 2), bits(load, 23, 1)
+        base_reg = bits(load, 5, 5)
+        bases = set()
+        for p in range(entry, br_pc, 4):   # adrp B ... add B, B, #imm (within 8 instructions), or adr B
+            w = self.word(p)
+            if (w & 0x9F00001F) == (0x90000000 | base_reg):
+                imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
+                page = (p & ~0xFFF) + ((imm - (1 << 21) if imm & (1 << 20) else imm) << 12)
+                for q in range(p + 4, min(p + 36, br_pc), 4):
+                    w2 = self.word(q)
+                    if (w2 & 0xFFC003FF) == (0x91000000 | base_reg << 5 | base_reg):
+                        bases.add(page + bits(w2, 10, 12))
+                        break
+            elif (w & 0x9F00001F) == (0x10000000 | base_reg):
+                imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
+                bases.add(p + (imm - (1 << 21) if imm & (1 << 20) else imm))
+        if len(bases) < 2:
+            return set()
+        image, lo = self.nso.image, self.base
+        out = set()
+        for tb in bases:
+            for i in range(4096):
+                at = tb - lo + i * size
+                if at < 0 or at + size > len(image):
+                    break
+                v = int.from_bytes(image[at:at + size], 'little', signed=bool(signed))
+                t = adr_t[1] + (v << shift)
+                if not (entry <= t < end) or t % 4:
+                    break
+                out.add(t)
+        return out
 
     def _jump_table_taken(self, br_pc, entry, end):
         """Form: cmp idx, #N ; b.ls/b.lo table ... table: <address math> ; br"""
