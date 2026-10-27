@@ -407,6 +407,9 @@ def step_finish(dump, state, cpus):
         'if not exist bench\\userdata xcopy /e /i /q userdata bench\\userdata >nul\n'
         'set TOTK_PROFILE_DIR=bench\\userdata\n'
         'if "%TOTK_BENCH%"=="" set TOTK_BENCH=60\n'
+        'rem The scene plays by itself once A is pressed: A every 3 s for the first 25 s, the game\'s own camera.\n'
+        'if "%TOTK_BENCH_KEYS%"=="" set TOTK_BENCH_KEYS=3:J:150,6:J:150,9:J:150,12:J:150,15:J:150,18:J:150,21:J:150,24:J:150\n'
+        'if "%TOTK_BENCH_ORBIT%"=="" set TOTK_BENCH_ORBIT=0\n'
         '"%~dp0UltraTears.exe" 2> bench\\last-run.log\n'   # by path: cmd may not run programs from the current folder
         'type bench\\results.csv\n')
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
